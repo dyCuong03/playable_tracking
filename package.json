@@ -1,0 +1,28 @@
+{
+  "name": "playable_tracking",
+  "version": "1.0.0",
+  "description": "This is server backend for playable tracking!",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dyCuong03/playable_tracking.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/dyCuong03/playable_tracking/issues"
+  },
+  "homepage": "https://github.com/dyCuong03/playable_tracking#readme",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.2.1",
+    "helmet": "^8.1.0",
+    "morgan": "^1.10.1",
+    "dotenv": "^16.4.0"
+  }
+}

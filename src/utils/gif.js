@@ -1,0 +1,4 @@
+﻿exports.PIXEL_GIF = Buffer.from(
+    "R0lGODlhAQABAPAAAAAAAAAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==",
+    "base64"
+);
