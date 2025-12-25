@@ -1,29 +1,42 @@
 ﻿# =========================
 # Production Image
 # =========================
-FROM node:20-alpine
+FROM node:20
 
-# Security & performance
+# =========================
+# Environment
+# =========================
 ENV NODE_ENV=production
+ENV PORT=9000
 
+# =========================
 # App directory
+# =========================
 WORKDIR /app
 
-# Copy only dependency files first (better cache)
+# =========================
+# Install dependencies
+# =========================
 COPY package*.json ./
+RUN npm install --only=production
 
-# Install only production dependencies
-RUN npm ci --only=production
-
-# Copy application source
+# =========================
+# Copy source code
+# =========================
 COPY src ./src
 
-# Expose service port
-EXPOSE 8080
+# =========================
+# Expose port
+# =========================
+EXPOSE 9000
 
-# Healthcheck (Docker-level)
+# =========================
+# Healthcheck
+# =========================
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD wget -qO- http://127.0.0.1:8080/health || exit 1
+  CMD curl -fs http://127.0.0.1:9000/health || exit 1
 
+# =========================
 # Start server
+# =========================
 CMD ["node", "src/server.js"]

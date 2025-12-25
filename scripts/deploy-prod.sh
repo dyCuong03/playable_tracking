@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "======================================"
+echo "🚀 DEPLOY NODE.JS PROJECT (PORT 9000)"
+echo "======================================"
+
 # =========================
 # CONFIG
 # =========================
 APP_NAME="pixel-server"
 IMAGE_NAME="pixel-server:latest"
-HOST_PORT=8080
-CONTAINER_PORT=8080
+HOST_PORT=9000
+CONTAINER_PORT=9000
 
 # =========================
-# GET PUBLIC IP
+# CHECK DOCKER
 # =========================
-SERVER_IP=$(
-  curl -s https://api.ipify.org || \
-  curl -s https://ifconfig.me || \
-  curl -s https://icanhazip.com
-)
-
-if [ -z "$SERVER_IP" ]; then
-  echo "❌ Cannot detect public IP"
+if ! command -v docker >/dev/null 2>&1; then
+  echo "❌ Docker is not installed"
   exit 1
 fi
 
-echo "🌍 Server Public IP: $SERVER_IP"
+docker --version
 
 # =========================
 # BUILD IMAGE
@@ -32,10 +30,10 @@ echo "📦 Building Docker image..."
 docker build -t "$IMAGE_NAME" .
 
 # =========================
-# STOP OLD CONTAINER
+# STOP OLD CONTAINER (SAFE)
 # =========================
 if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
-  echo "🛑 Stopping old container..."
+  echo "🛑 Stopping existing container..."
   docker stop "$APP_NAME"
   docker rm "$APP_NAME"
 else
@@ -45,36 +43,34 @@ fi
 # =========================
 # RUN CONTAINER
 # =========================
-echo "▶️ Starting container..."
+echo "▶️ Starting container on port ${HOST_PORT}..."
 docker run -d \
   --name "$APP_NAME" \
   --restart always \
   -p 0.0.0.0:${HOST_PORT}:${CONTAINER_PORT} \
   -e NODE_ENV=production \
+  -e PORT=${CONTAINER_PORT} \
   "$IMAGE_NAME"
 
 # =========================
-# WAIT FOR SERVER
+# WAIT FOR APP
 # =========================
-echo "⏳ Waiting for server..."
 sleep 3
 
 # =========================
-# VERIFY HEALTH
+# HEALTH CHECK
 # =========================
-if ! curl -fs "http://127.0.0.1:${HOST_PORT}/health" >/dev/null; then
+if curl -fs "http://127.0.0.1:${HOST_PORT}/health" >/dev/null; then
+  echo "✅ Health check passed"
+else
   echo "❌ Health check failed"
   docker logs "$APP_NAME"
   exit 1
 fi
 
-# =========================
-# PRINT READY-TO-USE URL
-# =========================
-TEST_URL="http://${SERVER_IP}:${HOST_PORT}/p.gif?e=test&sid=demo&rnd=$(date +%s)"
-
 echo "======================================"
 echo "✅ DEPLOY SUCCESS"
-echo "🌐 Pixel URL READY TO USE:"
-echo "👉 $TEST_URL"
+echo "🌐 Service running on:"
+echo "👉 http://<SERVER_IP>:${HOST_PORT}/health"
+echo "👉 http://<SERVER_IP>:${HOST_PORT}/p.gif"
 echo "======================================"
