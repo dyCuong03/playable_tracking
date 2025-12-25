@@ -14,14 +14,31 @@ HOST_PORT=9000
 CONTAINER_PORT=9000
 
 # =========================
+# DETECT PUBLIC IP (SAFE)
+# =========================
+echo "🌍 Detecting public IP..."
+
+SERVER_IP=$(
+  curl -s --max-time 3 https://api.ipify.org || \
+  curl -s --max-time 3 https://ifconfig.me || \
+  curl -s --max-time 3 https://icanhazip.com || \
+  echo ""
+)
+
+if [ -z "$SERVER_IP" ]; then
+  echo "⚠️  Cannot detect public IP (network blocked)"
+  echo "⚠️  URLs will be shown without IP"
+else
+  echo "🌍 Server Public IP: $SERVER_IP"
+fi
+
+# =========================
 # CHECK DOCKER
 # =========================
 if ! command -v docker >/dev/null 2>&1; then
   echo "❌ Docker is not installed"
   exit 1
 fi
-
-docker --version
 
 # =========================
 # BUILD IMAGE
@@ -30,7 +47,7 @@ echo "📦 Building Docker image..."
 docker build -t "$IMAGE_NAME" .
 
 # =========================
-# STOP OLD CONTAINER (SAFE)
+# STOP OLD CONTAINER
 # =========================
 if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
   echo "🛑 Stopping existing container..."
@@ -68,9 +85,20 @@ else
   exit 1
 fi
 
+# =========================
+# PRINT READY URL
+# =========================
 echo "======================================"
 echo "✅ DEPLOY SUCCESS"
-echo "🌐 Service running on:"
-echo "👉 http://<SERVER_IP>:${HOST_PORT}/health"
-echo "👉 http://<SERVER_IP>:${HOST_PORT}/p.gif"
+
+if [ -n "$SERVER_IP" ]; then
+  echo "🌐 Health URL:"
+  echo "👉 http://${SERVER_IP}:${HOST_PORT}/health"
+  echo "🌐 Pixel URL (READY TO USE):"
+  echo "👉 http://${SERVER_IP}:${HOST_PORT}/p.gif?e=test&sid=demo&rnd=$(date +%s)"
+else
+  echo "🌐 Server is running on port ${HOST_PORT}"
+  echo "👉 Cannot auto-detect IP, please check firewall / outbound network"
+fi
+
 echo "======================================"
