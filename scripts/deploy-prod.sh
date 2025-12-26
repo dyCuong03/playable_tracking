@@ -67,6 +67,7 @@ docker run -d \
   -p 0.0.0.0:${HOST_PORT}:${CONTAINER_PORT} \
   -e NODE_ENV=production \
   -e PORT=${CONTAINER_PORT} \
+  -v $(pwd)/logs:/app/logs \
   "$IMAGE_NAME"
 
 # =========================
