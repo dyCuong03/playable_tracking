@@ -23,10 +23,8 @@ logs/
 # =========================
 # Credentials / Secrets
 # =========================
-app/credentials/
-pixel-writer-key.json
-*.key.json
-*.service-account.json
+app/credentials/*
+!app/credentials/.gitkeep
 
 # =========================
 # OS files
