@@ -18,9 +18,12 @@ const ensureLogDir = () => {
     logDirReady = true;
 };
 
-exports.write = (event) => {
+exports.write = (event, silent = false) => {
     const payload = JSON.stringify(event);
-    console.log(payload);
+
+    if (!silent) {
+        console.log(payload);
+    }
 
     try {
         ensureLogDir();

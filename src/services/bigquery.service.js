@@ -5,6 +5,7 @@ const {
     bigQueryTable,
     bigQueryEnabled,
 } = require("../config");
+const logService = require("./log.service");
 
 let client;
 let tableRef;
@@ -59,34 +60,77 @@ const buildRow = (event) => ({
     event_hash: hashEvent(event),
 });
 
-const logInsertError = (error, row) => {
+const safeParseJSON = (value) => {
+    if (!value || typeof value !== "string") {
+        return {};
+    }
+
+    try {
+        return JSON.parse(value);
+    } catch (error) {
+        return {};
+    }
+};
+
+const normalizeLogEntry = (event, row, logEntry) => {
+    if (logEntry) {
+        return logEntry;
+    }
+
+    const payload = { ...(row || (event ? buildRow(event) : {})) };
+
+    if (
+        typeof payload.event_params !== "object" ||
+        payload.event_params === null
+    ) {
+        payload.event_params = (event && event.params) || safeParseJSON(payload.event_params);
+    }
+
+    return payload;
+};
+
+const logInsertError = (error, row, logEntry, event) => {
+    const entry = normalizeLogEntry(event, row, logEntry);
+
+    logService.write(
+        {
+            ...entry,
+            bigquery_status: "failed",
+            bigquery_error: {
+                message: error.message,
+                code: error.code || null,
+            },
+        },
+        true
+    );
+
     console.error(
         JSON.stringify({
             level: "error",
             type: "bigquery-insert",
             message: error.message,
-            eventHash: row.event_hash,
+            eventHash: (row && row.event_hash) || null,
         })
     );
 };
 
-const insertEvent = (event) => {
+const insertEvent = (event, row, logEntry) => {
     if (!isConfigured) {
         return Promise.resolve(false);
     }
 
-    const row = buildRow(event);
+    const payload = row || buildRow(event);
 
     try {
         return getTable()
-            .insert([row])
+            .insert([payload])
             .then(() => true)
             .catch((error) => {
-                logInsertError(error, row);
+                logInsertError(error, payload, logEntry, event);
                 return false;
             });
     } catch (error) {
-        logInsertError(error, row);
+        logInsertError(error, payload, logEntry, event);
         return Promise.resolve(false);
     }
 };

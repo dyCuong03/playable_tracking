@@ -40,11 +40,13 @@ exports.trackPixel = (req, res) => {
     const row = buildRow(event);
     const getDelay = calculateDelayTime(row.received_at);
 
-    logService.write({
+    const logEntry = {
         ...row,
         event_params: event.params,
         delay_time: getDelay(event.params.ts),
-    });
-    insertEvent(event);
+    };
+
+    logService.write(logEntry);
+    insertEvent(event, row, logEntry);
     sendPixel(res);
 };
