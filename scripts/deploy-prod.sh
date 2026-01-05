@@ -13,7 +13,7 @@ CONTAINER_PORT=9000
 # =========================
 # REQUIRED FILES
 # =========================
-KEY_FILE="$(pwd)/pixel-writer-key.json"
+KEY_FILE="$(pwd)/app/credentials/pixel-writer-key.json"
 
 if [[ ! -f "$KEY_FILE" ]]; then
   echo "Missing pixel-writer-key.json"
