@@ -13,6 +13,48 @@ IMAGE_NAME="pixel-server:latest"
 HOST_PORT=9000
 CONTAINER_PORT=9000
 
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "!! Required command '$cmd' is not installed or not in PATH."
+    exit 1
+  fi
+}
+
+npm_install_has_run=0
+
+run_npm_install() {
+  if [[ $npm_install_has_run -eq 0 ]]; then
+    echo "?? Installing npm dependencies (this may take a moment)..."
+    npm install
+    npm_install_has_run=1
+  fi
+}
+
+ensure_node_modules() {
+  if [[ ! -d "node_modules" ]]; then
+    echo "?? node_modules not found. Triggering npm install..."
+    run_npm_install
+  fi
+}
+
+ensure_bigquery_dependency() {
+  if ! node -e "const pkg=require('./package.json');const deps={...(pkg.dependencies||{}),...(pkg.devDependencies||{})};if(!deps['@google-cloud/bigquery']){console.error('Missing dependency @google-cloud/bigquery in package.json');process.exit(1);}"; then
+    echo "?? Dependency '@google-cloud/bigquery' is not declared in package.json. Run 'npm install @google-cloud/bigquery --save' and retry."
+    exit 1
+  fi
+
+  if [[ ! -d "node_modules/@google-cloud/bigquery" ]]; then
+    echo "?? '@google-cloud/bigquery' not found under node_modules. Running npm install..."
+    run_npm_install
+  fi
+
+  if [[ ! -d "node_modules/@google-cloud/bigquery" ]]; then
+    echo "?? Failed to install '@google-cloud/bigquery'. Please fix npm dependencies before deploying."
+    exit 1
+  fi
+}
+
 # =========================
 # DETECT PUBLIC IP (SAFE)
 # =========================
@@ -33,12 +75,18 @@ else
 fi
 
 # =========================
-# CHECK DOCKER
+# CHECK TOOLING
 # =========================
-if ! command -v docker >/dev/null 2>&1; then
-  echo "❌ Docker is not installed"
-  exit 1
-fi
+require_cmd docker
+require_cmd npm
+require_cmd node
+
+# =========================
+# VERIFY NPM DEPENDENCIES
+# =========================
+echo "🧪 Verifying npm dependencies..."
+ensure_node_modules
+ensure_bigquery_dependency
 
 # =========================
 # BUILD IMAGE
