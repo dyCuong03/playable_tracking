@@ -21,6 +21,14 @@ logs/
 *.log
 
 # =========================
+# Credentials / Secrets
+# =========================
+app/credentials/
+pixel-writer-key.json
+*.key.json
+*.service-account.json
+
+# =========================
 # OS files
 # =========================
 .DS_Store
