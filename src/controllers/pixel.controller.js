@@ -46,7 +46,7 @@ exports.trackPixel = (req, res) => {
         delay_time: getDelay(event.params.ts),
     };
 
-    logService.write(logEntry);
+    // logService.write(logEntry);
     insertEvent(event, row, logEntry);
     sendPixel(res);
 };
