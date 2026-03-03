@@ -38,6 +38,7 @@ const hashEvent = (event) => {
         playableId: event.playableId || "",
         sid: event.sid || "",
         platform: event.platform || "",
+        campaignRaw: event.campaignRaw || {},
         params: event.params || {},
         ip: event.ip || "",
         ua: event.ua || "",
@@ -54,6 +55,7 @@ const buildRow = (event) => ({
     playable_id: event.playableId || "",
     session_id: event.sid,
     platform: event.platform || "",
+    campaign_raw: JSON.stringify(event.campaignRaw || {}),
     event_params: JSON.stringify(event.params || {}),
     ip: event.ip,
     user_agent: event.ua,
@@ -86,6 +88,13 @@ const normalizeLogEntry = (event, row, logEntry) => {
         payload.event_params === null
     ) {
         payload.event_params = (event && event.params) || safeParseJSON(payload.event_params);
+    }
+
+    if (
+        typeof payload.campaign_raw !== "object" ||
+        payload.campaign_raw === null
+    ) {
+        payload.campaign_raw = (event && event.campaignRaw) || safeParseJSON(payload.campaign_raw);
     }
 
     return payload;

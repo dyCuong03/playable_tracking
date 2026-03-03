@@ -21,6 +21,7 @@ Follow these steps to make sure every `/p.gif` event is pushed to BigQuery while
      playable_id STRING,
      session_id STRING,
      platform STRING,
+     campaign_raw STRING,
      event_params STRING,
      ip STRING,
      user_agent STRING,
@@ -32,6 +33,7 @@ Follow these steps to make sure every `/p.gif` event is pushed to BigQuery while
    ```
 
    Partitioning on `received_at` keeps storage queries efficient as traffic grows.
+   `event_params` and `campaign_raw` are stored as JSON strings so you can preserve the original structured payloads sent to `/p.gif`.
 
 3. Provision a service account with permission to insert rows through the Cloud Console:
    1. Go to https://console.cloud.google.com/iam-admin/serviceaccounts.
@@ -62,12 +64,13 @@ export BIGQUERY_TABLE=vents
 
 1. Send a sample pixel request, e.g.
    ```
-   curl "http://<SERVER_IP>:9000/p.gif?e=test&pid=my-project&playableId=demo1&sid=abc&platform=ios&ts=1736179200000&campaign=summer"
+   curl "http://<SERVER_IP>:9000/p.gif?e=test&pid=my-project&playableId=demo1&sid=abc&platform=ios&camp=%7B%22network%22%3A%22example%22%2C%22campaignId%22%3A123%7D&ts=1736179200000&campaign=summer"
    ```
+   `camp` (or `campaign_raw`) must contain a JSON string (URL-encoded) so the server can persist the structured object in the `campaign_raw` column.
 2. Tail `logs/pixel-tracking.txt`; you should see a JSON entry containing all fields plus `delay_time`.
 3. Query the BigQuery table:
    ```sql
-   SELECT event_name, package_name, platform, event_params
+   SELECT event_name, package_name, platform, campaign_raw, event_params
    FROM `playable_tracking.pixel_events_ver_2`
    WHERE event_name = 'test'
    ORDER BY received_at DESC

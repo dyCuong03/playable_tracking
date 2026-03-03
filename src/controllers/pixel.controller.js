@@ -43,6 +43,7 @@ exports.trackPixel = (req, res) => {
     const logEntry = {
         ...row,
         event_params: event.params,
+        campaign_raw: event.campaignRaw,
         delay_time: getDelay(event.params.ts),
     };
 
