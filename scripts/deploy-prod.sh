@@ -64,7 +64,7 @@ docker run -d \
   -e PORT=${CONTAINER_PORT} \
   -e BIGQUERY_ENABLED=true \
   -e BIGQUERY_DATASET=playable_tracking \
-  -e BIGQUERY_TABLE=pixel_events \
+  -e BIGQUERY_TABLE=pixel_events_ver_2 \
   -e GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/pixel-writer-key.json \
   -v "$KEY_FILE":/app/credentials/pixel-writer-key.json:ro \
   "$IMAGE_NAME"

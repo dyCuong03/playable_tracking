@@ -13,7 +13,7 @@ Follow these steps to make sure every `/p.gif` event is pushed to BigQuery while
    2. Paste the schema below and hit **Run** (adjust dataset/table names if needed):
 
    ```sql
-   CREATE TABLE `playable_tracking.pixel_events`
+   CREATE TABLE `playable_tracking.pixel_events_ver_2`
    (
      event_time TIMESTAMP,
      event_name STRING,
@@ -47,7 +47,7 @@ Set the Google client credential path and BigQuery flags for the process that ru
 export GOOGLE_APPLICATION_CREDENTIALS=/etc/pixel-sa.json
 export BIGQUERY_ENABLED=true
 export BIGQUERY_DATASET=playable_tracking
-export BIGQUERY_TABLE=pixel_events
+export BIGQUERY_TABLE=vents
 ```
 
 `BIGQUERY_ENABLED` gates the insert logic; if it is `false` (default) the server will skip BigQuery writes while still logging to `logs/pixel-tracking.txt`.
@@ -68,7 +68,7 @@ export BIGQUERY_TABLE=pixel_events
 3. Query the BigQuery table:
    ```sql
    SELECT event_name, package_name, platform, event_params
-   FROM `playable_tracking.pixel_events`
+   FROM `playable_tracking.pixel_events_ver_2`
    WHERE event_name = 'test'
    ORDER BY received_at DESC
    LIMIT 10;
