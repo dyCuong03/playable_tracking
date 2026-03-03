@@ -17,9 +17,10 @@ Follow these steps to make sure every `/p.gif` event is pushed to BigQuery while
    (
      event_time TIMESTAMP,
      event_name STRING,
-     project_id STRING,
+     package_name STRING,
      playable_id STRING,
      session_id STRING,
+     platform STRING,
      event_params STRING,
      ip STRING,
      user_agent STRING,
@@ -61,12 +62,12 @@ export BIGQUERY_TABLE=pixel_events
 
 1. Send a sample pixel request, e.g.
    ```
-   curl "http://<SERVER_IP>:9000/p.gif?e=test&pid=my-project&playableId=demo1&sid=abc&ts=1736179200000&campaign=summer"
+   curl "http://<SERVER_IP>:9000/p.gif?e=test&pid=my-project&playableId=demo1&sid=abc&platform=ios&ts=1736179200000&campaign=summer"
    ```
 2. Tail `logs/pixel-tracking.txt`; you should see a JSON entry containing all fields plus `delay_time`.
 3. Query the BigQuery table:
    ```sql
-   SELECT event_name, project_id, event_params
+   SELECT event_name, package_name, platform, event_params
    FROM `playable_tracking.pixel_events`
    WHERE event_name = 'test'
    ORDER BY received_at DESC
