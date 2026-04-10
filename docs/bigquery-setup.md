@@ -8,12 +8,30 @@ Follow these steps to make sure every `/p.gif` event is pushed to BigQuery while
    1. Open https://console.cloud.google.com/bigquery and select the correct GCP project.
    2. In the left sidebar, click the three-dot menu next to the project and choose **Create dataset**.
    3. Enter `playable_tracking` (or your preferred name), select a region, leave encryption as Google-managed, and press **Create dataset**.
-2. Create a partitioned table for the events using the SQL workspace:
+2. Create 2 partitioned tables for the events using the SQL workspace:
    1. Click **Compose new query** in the console.
-   2. Paste the schema below and hit **Run** (adjust dataset/table names if needed):
+   2. Paste the schema below and hit **Run**:
 
    ```sql
    CREATE TABLE `playable_tracking.pixel_events_ver_2`
+   (
+     event_time TIMESTAMP,
+     event_name STRING,
+     package_name STRING,
+     playable_id STRING,
+     session_id STRING,
+     platform STRING,
+     campaign_raw STRING,
+     event_params STRING,
+     ip STRING,
+     user_agent STRING,
+     referer STRING,
+     received_at TIMESTAMP,
+     event_hash STRING
+   )
+   PARTITION BY DATE(received_at);
+
+   CREATE TABLE `playable_tracking.pixel_events_production`
    (
      event_time TIMESTAMP,
      event_name STRING,
@@ -49,10 +67,12 @@ Set the Google client credential path and BigQuery flags for the process that ru
 export GOOGLE_APPLICATION_CREDENTIALS=/etc/pixel-sa.json
 export BIGQUERY_ENABLED=true
 export BIGQUERY_DATASET=playable_tracking
-export BIGQUERY_TABLE=vents
 ```
 
 `BIGQUERY_ENABLED` gates the insert logic; if it is `false` (default) the server will skip BigQuery writes while still logging to `logs/pixel-tracking.txt`.
+The `/p.gif` query decides the table:
+- `env=production` -> `playable_tracking.pixel_events_production`
+- `env=test` (or missing/unknown value) -> `playable_tracking.pixel_events_ver_2`
 
 ## 3. Deploy
 
@@ -64,7 +84,8 @@ export BIGQUERY_TABLE=vents
 
 1. Send a sample pixel request, e.g.
    ```
-   curl "http://<SERVER_IP>:9000/p.gif?e=test&pid=my-project&playableId=demo1&sid=abc&platform=ios&camp=%7B%22network%22%3A%22example%22%2C%22campaignId%22%3A123%7D&ts=1736179200000&campaign=summer"
+   curl "http://<SERVER_IP>:9000/p.gif?e=test&env=test&pid=my-project&playableId=demo1&sid=abc&platform=ios&camp=%7B%22network%22%3A%22example%22%2C%22campaignId%22%3A123%7D&ts=1736179200000&campaign=summer"
+   curl "http://<SERVER_IP>:9000/p.gif?e=test&env=production&pid=my-project&playableId=demo1&sid=abc&platform=ios&camp=%7B%22network%22%3A%22example%22%2C%22campaignId%22%3A123%7D&ts=1736179200000&campaign=summer"
    ```
    `camp` (or `campaign_raw`) must contain a JSON string (URL-encoded) so the server can persist the structured object in the `campaign_raw` column.
 2. Tail `logs/pixel-tracking.txt`; you should see a JSON entry containing all fields plus `delay_time`.
@@ -78,4 +99,4 @@ export BIGQUERY_TABLE=vents
    ```
 4. Confirm the row shows up; `event_hash` lets you dedupe if needed.
 
-With these steps complete every incoming event will be persisted both in the log file and in BigQuery.***
+With these steps complete every incoming event will be persisted both in the log file and in BigQuery.

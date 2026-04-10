@@ -44,6 +44,7 @@ exports.trackPixel = (req, res) => {
         ...row,
         event_params: event.params,
         campaign_raw: event.campaignRaw,
+        tracking_environment: event.trackingEnvironment,
         delay_time: getDelay(event.params.ts),
     };
 

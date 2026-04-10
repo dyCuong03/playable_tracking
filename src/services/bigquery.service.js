@@ -8,11 +8,16 @@ const {
 const logService = require("./log.service");
 
 let client;
-let tableRef;
+const tableRefs = new Map();
+
+const TABLE_BY_ENVIRONMENT = {
+    production: "pixel_events_production",
+    test: "pixel_events_ver_2",
+};
+
 const isConfigured = Boolean(
     bigQueryEnabled &&
-    bigQueryDataset &&
-    bigQueryTable
+    bigQueryDataset
 );
 
 const getClient = () => {
@@ -23,12 +28,31 @@ const getClient = () => {
     return client;
 };
 
-const getTable = () => {
-    if (!tableRef) {
-        tableRef = getClient().dataset(bigQueryDataset).table(bigQueryTable);
+const getTable = (tableName) => {
+    if (!tableRefs.has(tableName)) {
+        tableRefs.set(
+            tableName,
+            getClient().dataset(bigQueryDataset).table(tableName)
+        );
     }
 
-    return tableRef;
+    return tableRefs.get(tableName);
+};
+
+const resolveTableName = (event) => {
+    const trackingEnvironment = String(event && event.trackingEnvironment ? event.trackingEnvironment : "")
+        .trim()
+        .toLowerCase();
+
+    if (TABLE_BY_ENVIRONMENT[trackingEnvironment]) {
+        return TABLE_BY_ENVIRONMENT[trackingEnvironment];
+    }
+
+    if (bigQueryTable) {
+        return bigQueryTable;
+    }
+
+    return TABLE_BY_ENVIRONMENT.test;
 };
 
 const hashEvent = (event) => {
@@ -38,6 +62,7 @@ const hashEvent = (event) => {
         playableId: event.playableId || "",
         sid: event.sid || "",
         platform: event.platform || "",
+        trackingEnvironment: event.trackingEnvironment || "test",
         campaignRaw: event.campaignRaw || {},
         params: event.params || {},
         ip: event.ip || "",
@@ -100,12 +125,13 @@ const normalizeLogEntry = (event, row, logEntry) => {
     return payload;
 };
 
-const logInsertError = (error, row, logEntry, event) => {
+const logInsertError = (error, row, logEntry, event, tableName) => {
     const entry = normalizeLogEntry(event, row, logEntry);
 
     logService.write(
         {
             ...entry,
+            bigquery_table: tableName,
             bigquery_status: "failed",
             bigquery_error: {
                 message: error.message,
@@ -120,6 +146,7 @@ const logInsertError = (error, row, logEntry, event) => {
             level: "error",
             type: "bigquery-insert",
             message: error.message,
+            tableName,
             eventHash: (row && row.event_hash) || null,
         })
     );
@@ -131,17 +158,18 @@ const insertEvent = (event, row, logEntry) => {
     }
 
     const payload = row || buildRow(event);
+    const tableName = resolveTableName(event);
 
     try {
-        return getTable()
+        return getTable(tableName)
             .insert([payload])
             .then(() => true)
             .catch((error) => {
-                logInsertError(error, payload, logEntry, event);
+                logInsertError(error, payload, logEntry, event, tableName);
                 return false;
             });
     } catch (error) {
-        logInsertError(error, payload, logEntry, event);
+        logInsertError(error, payload, logEntry, event, tableName);
         return Promise.resolve(false);
     }
 };
