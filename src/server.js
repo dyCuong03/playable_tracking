@@ -1,6 +1,6 @@
-﻿const app = require("./app");
+const app = require("./app");
 const { PORT } = require("./config");
 
 app.listen(PORT, () => {
-    console.log(`🚀 Pixel server running on port ${PORT}`);
+    console.log(`Pixel server running on port ${PORT}`);
 });

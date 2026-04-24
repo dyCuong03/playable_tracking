@@ -1,54 +1,20 @@
 const { buildEvent } = require("../services/event.service");
 const { sendPixel } = require("../services/pixel.service");
-const logService = require("../services/log.service");
-const { insertEvent, buildRow } = require("../services/bigquery.service");
+const { buildRow, resolveTableName } = require("../services/bigquery.service");
+const { enqueueEvent } = require("../services/stream-queue.service");
 
-const parseTimestamp = (value) => {
-    if (value === undefined || value === null || value === "") {
-        return null;
-    }
-
-    const numeric = Number(value);
-    if (!Number.isNaN(numeric)) {
-        if (numeric < 1_000_000_000_000) {
-            return numeric * 1000;
-        }
-        return numeric;
-    }
-
-    const parsed = Date.parse(value);
-    if (!Number.isNaN(parsed)) {
-        return parsed;
-    }
-
-    return null;
-};
-
-const calculateDelayTime = (receivedAt) => (tsValue) => {
-    const receivedMs = Date.parse(receivedAt);
-    const tsMs = parseTimestamp(tsValue);
-
-    if (Number.isNaN(receivedMs) || tsMs === null) {
-        return null;
-    }
-
-    return receivedMs - tsMs;
-};
-
-exports.trackPixel = (req, res) => {
+exports.trackPixel = async (req, res) => {
     const event = buildEvent(req);
     const row = buildRow(event);
-    const getDelay = calculateDelayTime(row.received_at);
 
-    const logEntry = {
-        ...row,
-        event_params: event.params,
-        campaign_raw: event.campaignRaw,
-        tracking_environment: event.trackingEnvironment,
-        delay_time: getDelay(event.params.ts),
-    };
+    try {
+        await enqueueEvent({
+            tableName: resolveTableName(event),
+            row,
+        });
+    } catch (error) {
+        console.error("Failed to queue BigQuery event", error);
+    }
 
-    // logService.write(logEntry);
-    insertEvent(event, row, logEntry);
     sendPixel(res);
 };

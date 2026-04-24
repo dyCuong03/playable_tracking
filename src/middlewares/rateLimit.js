@@ -1,35 +1,40 @@
-﻿// src/middlewares/rateLimit.js
+const {
+    rateLimitWindowMs,
+    rateLimitMax,
+    rateLimitPrefix,
+} = require("../config");
+const { getRedisClient } = require("../services/redis.service");
 
-const hits = new Map();
+const RATE_LIMIT_LUA = `
+local current = redis.call("INCR", KEYS[1])
+if current == 1 then
+    redis.call("PEXPIRE", KEYS[1], ARGV[1])
+end
+return current
+`;
 
-module.exports = (req, res, next) => {
+module.exports = async (req, res, next) => {
     const ip = req.ip || "unknown";
-    const now = Date.now();
+    const key = `${rateLimitPrefix}:${ip}`;
 
-    const WINDOW_MS = 10_000; // 10 seconds
-    const LIMIT = 200;       // max requests per IP per window
+    try {
+        const redis = await getRedisClient();
 
-    let record = hits.get(ip);
+        if (!redis) {
+            return next();
+        }
 
-    if (!record) {
-        record = { count: 1, start: now };
-        hits.set(ip, record);
-        return next();
+        const current = await redis.eval(RATE_LIMIT_LUA, {
+            keys: [key],
+            arguments: [String(rateLimitWindowMs)],
+        });
+
+        req.rateLimitCount = Number(current);
+        req.rateLimitExceeded = Number(current) > rateLimitMax;
+
+        next();
+    } catch (error) {
+        console.error("Redis rate limit failed", error);
+        next();
     }
-
-    if (now - record.start > WINDOW_MS) {
-        record.count = 1;
-        record.start = now;
-        return next();
-    }
-
-    record.count += 1;
-
-    if (record.count > LIMIT) {
-        // IMPORTANT: still return pixel, don't block playable
-        res.status(200).end();
-        return;
-    }
-
-    next();
 };

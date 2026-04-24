@@ -152,6 +152,16 @@ const logInsertError = (error, row, logEntry, event, tableName) => {
     );
 };
 
+const insertBatch = (tableName, rows) => {
+    return getTable(tableName).insert(
+        rows.map((row) => ({
+            insertId: row.event_hash,
+            json: row,
+        })),
+        { raw: true }
+    );
+};
+
 const insertEvent = (event, row, logEntry) => {
     if (!isConfigured) {
         return Promise.resolve(false);
@@ -161,8 +171,7 @@ const insertEvent = (event, row, logEntry) => {
     const tableName = resolveTableName(event);
 
     try {
-        return getTable(tableName)
-            .insert([payload])
+        return insertBatch(tableName, [payload])
             .then(() => true)
             .catch((error) => {
                 logInsertError(error, payload, logEntry, event, tableName);
@@ -176,6 +185,10 @@ const insertEvent = (event, row, logEntry) => {
 
 module.exports = {
     insertEvent,
+    insertBatch,
     buildRow,
     hashEvent,
+    isBigQueryConfigured: () => isConfigured,
+    resolveTableName,
+    logInsertError,
 };
