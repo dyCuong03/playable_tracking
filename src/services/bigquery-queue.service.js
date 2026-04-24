@@ -1,193 +1,75 @@
+const fs = require("fs");
+const path = require("path");
+
 const {
-    bigQueryBatchSize,
-    bigQueryFlushIntervalMs,
-    bigQueryMaxQueueSize,
-    bigQueryRetryDelayMs,
-    bigQueryErrorLogIntervalMs,
+    bigQueryQueueDir,
+    bigQueryQueueShards,
 } = require("../config");
-const {
-    insertBatch,
-    isBigQueryConfigured,
-} = require("./bigquery.service");
 
-const queue = [];
+const BASE_DIR = path.resolve(process.cwd(), bigQueryQueueDir);
+const PENDING_DIR = path.join(BASE_DIR, "pending");
+const READY_DIR = path.join(BASE_DIR, "ready");
+const PROCESSING_DIR = path.join(BASE_DIR, "processing");
 
-let timer;
-let processing = false;
-let pausedUntil = 0;
-let nextItemId = 1;
-let lastErrorLogAt = 0;
-let lastDropLogAt = 0;
+let ensurePromise;
+let nextShard = 0;
+const appendChains = new Map();
 
-const shouldLogNow = (lastLogAt) => (Date.now() - lastLogAt) >= bigQueryErrorLogIntervalMs;
-
-const logQueue = (level, type, message, details = {}) => {
-    if (level === "error") {
-        if (!shouldLogNow(lastErrorLogAt)) {
-            return;
-        }
-
-        lastErrorLogAt = Date.now();
-        console.error(JSON.stringify({ level, type, message, ...details }));
-        return;
+const ensureQueueDir = async () => {
+    if (!ensurePromise) {
+        ensurePromise = Promise.all([
+            fs.promises.mkdir(PENDING_DIR, { recursive: true }),
+            fs.promises.mkdir(READY_DIR, { recursive: true }),
+            fs.promises.mkdir(PROCESSING_DIR, { recursive: true }),
+        ]);
     }
 
-    if (!shouldLogNow(lastDropLogAt)) {
-        return;
-    }
-
-    lastDropLogAt = Date.now();
-    console.warn(JSON.stringify({ level, type, message, ...details }));
+    await ensurePromise;
 };
 
-const getFailedInsertIds = (error) => {
-    if (!Array.isArray(error && error.errors)) {
-        return [];
-    }
+const serializeItem = (queueItem) => `${JSON.stringify(queueItem)}\n`;
 
-    return error.errors
-        .map((entry) => entry && entry.row && entry.row.insertId)
-        .filter(Boolean);
-};
+const getPendingFilePath = (shard) => path.join(PENDING_DIR, `pending-${shard}.ndjson`);
 
-const removeItemsById = (itemIds) => {
-    if (!itemIds.length) {
-        return;
-    }
+const getReadyFilePath = (suffix) => path.join(READY_DIR, `ready-${suffix}.ndjson`);
 
-    const idSet = new Set(itemIds);
+const getProcessingFilePath = (workerName, suffix) => path.join(PROCESSING_DIR, `processing-${workerName}-${suffix}.ndjson`);
 
-    for (let index = queue.length - 1; index >= 0; index -= 1) {
-        if (idSet.has(queue[index].id)) {
-            queue.splice(index, 1);
-        }
-    }
-};
-
-const buildBatch = () => queue.slice(0, Math.max(1, bigQueryBatchSize));
-
-const groupBatchByTable = (items) => items.reduce((acc, item) => {
-    if (!acc.has(item.tableName)) {
-        acc.set(item.tableName, []);
-    }
-
-    acc.get(item.tableName).push(item);
-    return acc;
-}, new Map());
-
-const processTableItems = async (tableName, items) => {
-    try {
-        await insertBatch(
-            tableName,
-            items.map((item) => item.row)
-        );
-
-        return {
-            status: "success",
-            removeIds: items.map((item) => item.id),
-        };
-    } catch (error) {
-        const failedInsertIds = new Set(getFailedInsertIds(error));
-
-        if (failedInsertIds.size > 0) {
-            logQueue("warn", "bigquery-queue-drop", "Dropping rows rejected by BigQuery", {
-                tableName,
-                count: items.length,
-                reason: error.message,
-            });
-
-            return {
-                status: "drop",
-                removeIds: items.map((item) => item.id),
-            };
-        }
-
-        logQueue("error", "bigquery-queue", "BigQuery insert failed; queue worker will retry", {
-            tableName,
-            count: items.length,
-            reason: error.message,
-            queueSize: queue.length,
-        });
-
-        return {
-            status: "retry",
-            removeIds: [],
-        };
-    }
-};
-
-const processQueue = async () => {
-    if (processing || !queue.length || Date.now() < pausedUntil) {
-        return;
-    }
-
-    if (!isBigQueryConfigured()) {
-        return;
-    }
-
-    processing = true;
-
-    try {
-        const batch = buildBatch();
-        const grouped = groupBatchByTable(batch);
-        const removeIds = [];
-
-        for (const [tableName, items] of grouped.entries()) {
-            const result = await processTableItems(tableName, items);
-
-            if (result.status === "retry") {
-                pausedUntil = Date.now() + Math.max(1000, bigQueryRetryDelayMs);
-                break;
-            }
-
-            removeIds.push(...result.removeIds);
-        }
-
-        removeItemsById(removeIds);
-    } finally {
-        processing = false;
-    }
+const getNextShard = () => {
+    const shardCount = Math.max(1, bigQueryQueueShards);
+    const shard = nextShard % shardCount;
+    nextShard += 1;
+    return shard;
 };
 
 const enqueueEvent = async (queueItem) => {
-    if (queue.length >= Math.max(1, bigQueryMaxQueueSize)) {
-        logQueue("warn", "bigquery-queue-drop", "Dropping event because local queue is full", {
-            queueSize: queue.length,
-            maxQueueSize: bigQueryMaxQueueSize,
-            eventHash: queueItem && queueItem.row ? queueItem.row.event_hash : null,
-        });
-        return false;
-    }
+    await ensureQueueDir();
 
-    queue.push({
-        id: nextItemId,
-        tableName: queueItem.tableName,
-        row: queueItem.row,
-    });
-    nextItemId += 1;
+    const shard = getNextShard();
+    const targetFile = getPendingFilePath(shard);
+    const payload = serializeItem(queueItem);
+    const chain = appendChains.get(targetFile) || Promise.resolve();
 
-    if (queue.length >= Math.max(1, bigQueryBatchSize)) {
-        void processQueue();
-    }
+    const nextChain = chain.catch(() => {}).then(() => fs.promises.appendFile(
+        targetFile,
+        payload,
+        "utf8"
+    ));
 
+    appendChains.set(targetFile, nextChain);
+    await nextChain;
     return true;
-};
-
-const initBigQueryQueue = () => {
-    if (timer) {
-        return;
-    }
-
-    timer = setInterval(() => {
-        void processQueue();
-    }, Math.max(250, bigQueryFlushIntervalMs));
-
-    if (typeof timer.unref === "function") {
-        timer.unref();
-    }
 };
 
 module.exports = {
     enqueueEvent,
-    initBigQueryQueue,
+    ensureQueueDir,
+    serializeItem,
+    getPendingFilePath,
+    getReadyFilePath,
+    getProcessingFilePath,
+    BASE_DIR,
+    PENDING_DIR,
+    READY_DIR,
+    PROCESSING_DIR,
 };
