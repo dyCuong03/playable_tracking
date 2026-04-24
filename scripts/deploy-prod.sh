@@ -5,12 +5,10 @@ echo "======================================"
 echo "DEPLOY NODE.JS PIXEL SERVER (PROD)"
 echo "======================================"
 
-SERVER_APP_NAME="pixel-server"
-WORKER_APP_NAME="pixel-worker"
+APP_NAME="pixel-server"
 IMAGE_NAME="pixel-server:latest"
 HOST_PORT=9000
 CONTAINER_PORT=9000
-REDIS_URL="${REDIS_URL:-redis://host.docker.internal:6379}"
 
 # =========================
 # REQUIRED FILES
@@ -49,52 +47,31 @@ docker build -t "$IMAGE_NAME" .
 # =========================
 # STOP OLD CONTAINERS
 # =========================
-if docker ps -a --format '{{.Names}}' | grep -q "^${SERVER_APP_NAME}$"; then
-  docker rm -f "$SERVER_APP_NAME"
-fi
-
-if docker ps -a --format '{{.Names}}' | grep -q "^${WORKER_APP_NAME}$"; then
-  docker rm -f "$WORKER_APP_NAME"
+if docker ps -a --format '{{.Names}}' | grep -q "^${APP_NAME}$"; then
+  docker rm -f "$APP_NAME"
 fi
 
 # =========================
-# RUN SERVER CONTAINER
+# RUN CONTAINER
 # =========================
-echo "Starting server container..."
+echo "Starting container..."
 
 docker run -d \
-  --name "$SERVER_APP_NAME" \
+  --name "$APP_NAME" \
   --restart always \
-  --add-host=host.docker.internal:host-gateway \
   -p ${HOST_PORT}:${CONTAINER_PORT} \
   -e NODE_ENV=production \
   -e PORT=${CONTAINER_PORT} \
   -e BIGQUERY_ENABLED=true \
   -e BIGQUERY_DATASET=playable_tracking \
   -e BIGQUERY_TABLE=pixel_events_ver_2 \
-  -e REDIS_URL=${REDIS_URL} \
+  -e BIGQUERY_BATCH_SIZE=${BIGQUERY_BATCH_SIZE:-100} \
+  -e BIGQUERY_FLUSH_INTERVAL_MS=${BIGQUERY_FLUSH_INTERVAL_MS:-1000} \
+  -e BIGQUERY_MAX_QUEUE_SIZE=${BIGQUERY_MAX_QUEUE_SIZE:-10000} \
+  -e BIGQUERY_RETRY_DELAY_MS=${BIGQUERY_RETRY_DELAY_MS:-30000} \
   -e GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/pixel-writer-key.json \
   -v "$KEY_FILE":/app/credentials/pixel-writer-key.json:ro \
   "$IMAGE_NAME"
-
-# =========================
-# RUN WORKER CONTAINER
-# =========================
-echo "Starting worker container..."
-
-docker run -d \
-  --name "$WORKER_APP_NAME" \
-  --restart always \
-  --add-host=host.docker.internal:host-gateway \
-  -e NODE_ENV=production \
-  -e BIGQUERY_ENABLED=true \
-  -e BIGQUERY_DATASET=playable_tracking \
-  -e BIGQUERY_TABLE=pixel_events_ver_2 \
-  -e REDIS_URL=${REDIS_URL} \
-  -e GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/pixel-writer-key.json \
-  -v "$KEY_FILE":/app/credentials/pixel-writer-key.json:ro \
-  "$IMAGE_NAME" \
-  node src/worker.js
 
 # =========================
 # HEALTH CHECK
@@ -103,7 +80,7 @@ sleep 5
 if curl -fs "http://127.0.0.1:${HOST_PORT}/health" >/dev/null; then
   echo "DEPLOY SUCCESS"
 else
-  docker logs "$SERVER_APP_NAME"
+  docker logs "$APP_NAME"
   exit 1
 fi
 

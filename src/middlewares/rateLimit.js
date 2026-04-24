@@ -1,40 +1,23 @@
 const {
     rateLimitWindowMs,
     rateLimitMax,
-    rateLimitPrefix,
 } = require("../config");
-const { getRedisClient } = require("../services/redis.service");
-
-const RATE_LIMIT_LUA = `
-local current = redis.call("INCR", KEYS[1])
-if current == 1 then
-    redis.call("PEXPIRE", KEYS[1], ARGV[1])
-end
-return current
-`;
+const hits = new Map();
 
 module.exports = async (req, res, next) => {
     const ip = req.ip || "unknown";
-    const key = `${rateLimitPrefix}:${ip}`;
+    const now = Date.now();
 
-    try {
-        const redis = await getRedisClient();
+    let record = hits.get(ip);
 
-        if (!redis) {
-            return next();
-        }
-
-        const current = await redis.eval(RATE_LIMIT_LUA, {
-            keys: [key],
-            arguments: [String(rateLimitWindowMs)],
-        });
-
-        req.rateLimitCount = Number(current);
-        req.rateLimitExceeded = Number(current) > rateLimitMax;
-
-        next();
-    } catch (error) {
-        console.error("Redis rate limit failed", error);
-        next();
+    if (!record || (now - record.start) > rateLimitWindowMs) {
+        record = { count: 0, start: now };
+        hits.set(ip, record);
     }
+
+    record.count += 1;
+    req.rateLimitCount = record.count;
+    req.rateLimitExceeded = record.count > rateLimitMax;
+
+    next();
 };
