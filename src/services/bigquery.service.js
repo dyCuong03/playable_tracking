@@ -57,6 +57,8 @@ const resolveTableName = (event) => {
 
 const hashEvent = (event) => {
     const payload = JSON.stringify({
+        requestTime: event.time || "",
+        clientTimestamp: event.clientTimestamp || "",
         event: event.event || "",
         pid: event.pid || "",
         playableId: event.playableId || "",

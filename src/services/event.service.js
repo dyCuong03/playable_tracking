@@ -69,19 +69,21 @@ const buildParams = (query) => {
 
 exports.buildEvent = (req) => {
     const query = req.query || {};
+    const clientTimestamp = query.ts || query.timestamp || query.client_ts || "";
 
     return {
         time: new Date().toISOString(),
+        clientTimestamp: String(clientTimestamp || ""),
         event: query.e || "",
         pid: query.pid || query.package_name || query.project_id || "",
         playableId: query.playableId || query.playable_id || "",
-        sid: query.sid || "",
+        sid: query.sid || query.session_id || "",
         platform: query.platform || query.plf || "",
         campaignRaw: parseJSONField(query.campaign_raw || query.camp),
         trackingEnvironment: resolveTrackingEnvironment(query),
         params: buildParams(query),
         ip: req.ip || "",
         ua: req.get("user-agent") || "",
-        ref: req.get("referer") || "",
+        ref: query.ref || req.get("referer") || "",
     };
 };

@@ -14,6 +14,7 @@ const {
 const {
     insertBatch,
     isBigQueryConfigured,
+    logInsertError,
 } = require("./bigquery.service");
 const {
     ensureQueueDir,
@@ -21,6 +22,7 @@ const {
     getPendingFilePath,
     getReadyFilePath,
     getProcessingFilePath,
+    getRejectedFilePath,
     READY_DIR,
     PROCESSING_DIR,
 } = require("./bigquery-queue.service");
@@ -70,6 +72,60 @@ const getFailedInsertIds = (error) => {
         .filter(Boolean);
 };
 
+const getChunkItemByInsertId = (chunk) => chunk.items.reduce((acc, item) => {
+    if (item && item.row && item.row.event_hash) {
+        acc.set(item.row.event_hash, item);
+    }
+
+    return acc;
+}, new Map());
+
+const getRowErrors = (error) => {
+    if (!Array.isArray(error && error.errors)) {
+        return [];
+    }
+
+    return error.errors.filter(Boolean);
+};
+
+const getRowErrorReasons = (rowError) => {
+    if (!Array.isArray(rowError && rowError.errors)) {
+        return [];
+    }
+
+    return rowError.errors
+        .map((entry) => String((entry && entry.reason) || "").trim())
+        .filter(Boolean);
+};
+
+const isRetryableReason = (reason) => [
+    "backendError",
+    "internalError",
+    "rateLimitExceeded",
+    "quotaExceeded",
+    "timeout",
+    "stopped",
+].includes(reason);
+
+const isRetryableRowError = (rowError) => {
+    const reasons = getRowErrorReasons(rowError);
+
+    if (!reasons.length) {
+        return false;
+    }
+
+    return reasons.every(isRetryableReason);
+};
+
+const buildRowErrorMessage = (error, rowError) => {
+    const reasons = getRowErrorReasons(rowError);
+    if (!reasons.length) {
+        return error.message;
+    }
+
+    return `${error.message} [${reasons.join(",")}]`;
+};
+
 const readQueueFile = async (filePath) => {
     const content = await fs.promises.readFile(filePath, "utf8");
 
@@ -91,6 +147,15 @@ const touchFile = async (filePath) => {
 const writeQueueFile = async (filePath, items) => {
     const payload = items.map(serializeItem).join("");
     await fs.promises.writeFile(filePath, payload, "utf8");
+};
+
+const appendQueueFile = async (filePath, items) => {
+    if (!items.length) {
+        return;
+    }
+
+    const payload = items.map(serializeItem).join("");
+    await fs.promises.appendFile(filePath, payload, "utf8");
 };
 
 const rotatePendingFile = async () => {
@@ -223,11 +288,82 @@ const processFile = async (filePath) => {
             const failedInsertIds = new Set(getFailedInsertIds(error));
 
             if (failedInsertIds.size > 0) {
-                logWorker("warn", "bigquery-worker-drop", "Dropping rows rejected by BigQuery", {
-                    tableName: chunk.tableName,
-                    count: failedInsertIds.size,
-                    reason: error.message,
-                });
+                const chunkItemsByInsertId = getChunkItemByInsertId(chunk);
+                const rowErrors = getRowErrors(error);
+                const retryItems = [];
+                const rejectedItems = [];
+
+                for (const rowError of rowErrors) {
+                    const insertId = rowError && rowError.row && rowError.row.insertId;
+                    if (!insertId) {
+                        continue;
+                    }
+
+                    const failedItem = chunkItemsByInsertId.get(insertId);
+                    if (!failedItem) {
+                        continue;
+                    }
+
+                    if (isRetryableRowError(rowError)) {
+                        retryItems.push(failedItem);
+                        continue;
+                    }
+
+                    rejectedItems.push({
+                        item: failedItem,
+                        message: buildRowErrorMessage(error, rowError),
+                    });
+                }
+
+                if (rejectedItems.length > 0) {
+                    const rejectedFile = getRejectedFilePath(`${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
+                    await appendQueueFile(
+                        rejectedFile,
+                        rejectedItems.map((rejected) => ({
+                            tableName: chunk.tableName,
+                            row: rejected.item.row,
+                            rejectedAt: new Date().toISOString(),
+                            error: rejected.message,
+                        }))
+                    );
+
+                    for (const rejected of rejectedItems) {
+                        logInsertError(
+                            { message: rejected.message, code: error.code || null },
+                            rejected.item.row,
+                            null,
+                            null,
+                            chunk.tableName
+                        );
+                    }
+
+                    logWorker("warn", "bigquery-worker-drop", "Dropped rows rejected by BigQuery", {
+                        tableName: chunk.tableName,
+                        count: rejectedItems.length,
+                        reason: error.message,
+                    });
+                }
+
+                if (retryItems.length > 0) {
+                    remaining.push(...retryItems);
+
+                    for (let pendingIndex = index + 1; pendingIndex < chunks.length; pendingIndex += 1) {
+                        remaining.push(...chunks[pendingIndex].items);
+                    }
+
+                    const readyFile = getReadyFilePath(`retry-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
+                    await writeQueueFile(readyFile, remaining);
+                    await fs.promises.unlink(filePath).catch(() => {});
+
+                    logWorker("warn", "bigquery-worker-retry", "Re-queued retryable rows after partial BigQuery failure", {
+                        tableName: chunk.tableName,
+                        count: retryItems.length,
+                        reason: error.message,
+                    });
+
+                    await sleep(Math.max(1000, bigQueryRetryDelayMs));
+                    return;
+                }
 
                 continue;
             }
