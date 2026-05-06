@@ -1,8 +1,10 @@
 worker_processes auto;
+worker_rlimit_nofile 200000;
 
 events {
-    worker_connections 4096;
+    worker_connections 16384;
     multi_accept on;
+    use epoll;
 }
 
 http {
@@ -15,6 +17,9 @@ http {
     keepalive_timeout 30;
     keepalive_requests 10000;
     reset_timedout_connection on;
+    send_timeout 15s;
+
+    access_log off;
 
     upstream pixel_backend {
 __UPSTREAM_SERVERS__
@@ -22,7 +27,7 @@ __UPSTREAM_SERVERS__
     }
 
     server {
-        listen 9000 backlog=65535;
+        listen 9000 reuseport backlog=65535;
         server_name _;
 
         location /health {
@@ -43,6 +48,9 @@ __UPSTREAM_SERVERS__
             proxy_connect_timeout 3s;
             proxy_read_timeout 15s;
             proxy_send_timeout 15s;
+            proxy_next_upstream error timeout invalid_header http_502 http_503 http_504;
+            proxy_next_upstream_tries 2;
+            proxy_buffering off;
             proxy_pass http://pixel_backend;
         }
     }
