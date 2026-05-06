@@ -159,6 +159,21 @@ for i in $(seq 1 "$APP_REPLICAS"); do
     "$IMAGE_NAME"
 done
 
+echo "Waiting for app containers to become healthy..."
+for i in $(seq 1 "$APP_REPLICAS"); do
+  SERVER_APP_NAME="${SERVER_APP_PREFIX}-${i}"
+  ATTEMPTS=0
+  until [ "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}unknown{{end}}' "$SERVER_APP_NAME")" = "healthy" ]; do
+    ATTEMPTS=$((ATTEMPTS + 1))
+    if [ "$ATTEMPTS" -ge 30 ]; then
+      echo "App container ${SERVER_APP_NAME} did not become healthy in time"
+      docker logs "$SERVER_APP_NAME"
+      exit 1
+    fi
+    sleep 2
+  done
+done
+
 docker run -d \
   --name "$NGINX_APP_NAME" \
   --restart always \
@@ -202,13 +217,18 @@ done
 # =========================
 # HEALTH CHECK
 # =========================
-sleep 5
-if curl -fs "http://127.0.0.1:${HOST_PORT}/health" >/dev/null; then
-  echo "DEPLOY SUCCESS"
-else
-  docker logs "$NGINX_APP_NAME"
-  exit 1
-fi
+echo "Waiting for nginx health check..."
+ATTEMPTS=0
+until curl -fs "http://127.0.0.1:${HOST_PORT}/health" >/dev/null; do
+  ATTEMPTS=$((ATTEMPTS + 1))
+  if [ "$ATTEMPTS" -ge 30 ]; then
+    docker logs "$NGINX_APP_NAME"
+    exit 1
+  fi
+  sleep 2
+done
+
+echo "DEPLOY SUCCESS"
 
 # =========================
 # PRINT URL
