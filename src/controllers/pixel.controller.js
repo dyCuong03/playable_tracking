@@ -1,7 +1,7 @@
 const { buildEvent } = require("../services/event.service");
 const { sendPixel } = require("../services/pixel.service");
 const { buildRow, resolveTableName } = require("../services/bigquery.service");
-const { enqueueEvent } = require("../services/bigquery-queue.service");
+const { enqueueEvent } = require("../services/redis-queue.service");
 
 exports.trackPixel = (req, res) => {
     const event = buildEvent(req);
@@ -15,7 +15,7 @@ exports.trackPixel = (req, res) => {
             tableName,
             row,
         }).catch((error) => {
-            console.error("Failed to queue BigQuery event", error);
+            console.error("Failed to queue BigQuery event", error.message);
         });
     });
 };

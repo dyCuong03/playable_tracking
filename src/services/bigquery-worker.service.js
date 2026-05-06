@@ -1,12 +1,10 @@
-const fs = require("fs");
 const os = require("os");
-const path = require("path");
 
 const {
     bigQueryBatchSize,
+    bigQueryMaxRetries,
     bigQueryRetryDelayMs,
     bigQueryErrorLogIntervalMs,
-    bigQueryQueueShards,
     bigQueryWorkerPollMs,
     bigQueryWorkerLeaseMs,
     bigQueryWorkerName,
@@ -17,15 +15,13 @@ const {
     logInsertError,
 } = require("./bigquery.service");
 const {
-    ensureQueueDir,
-    serializeItem,
-    getPendingFilePath,
-    getReadyFilePath,
-    getProcessingFilePath,
-    getRejectedFilePath,
-    READY_DIR,
-    PROCESSING_DIR,
-} = require("./bigquery-queue.service");
+    ensureQueueReady,
+    readQueueBatch,
+    claimPendingBatch,
+    acknowledgeMessages,
+    requeueItems,
+    rejectItems,
+} = require("./redis-queue.service");
 
 const workerName = (bigQueryWorkerName || `${os.hostname()}-${process.pid}`)
     .replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -126,119 +122,6 @@ const buildRowErrorMessage = (error, rowError) => {
     return `${error.message} [${reasons.join(",")}]`;
 };
 
-const readQueueFile = async (filePath) => {
-    const content = await fs.promises.readFile(filePath, "utf8");
-
-    if (!content.trim()) {
-        return [];
-    }
-
-    return content
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line));
-};
-
-const touchFile = async (filePath) => {
-    const now = new Date();
-    await fs.promises.utimes(filePath, now, now).catch(() => {});
-};
-
-const writeQueueFile = async (filePath, items) => {
-    const payload = items.map(serializeItem).join("");
-    await fs.promises.writeFile(filePath, payload, "utf8");
-};
-
-const appendQueueFile = async (filePath, items) => {
-    if (!items.length) {
-        return;
-    }
-
-    const payload = items.map(serializeItem).join("");
-    await fs.promises.appendFile(filePath, payload, "utf8");
-};
-
-const rotatePendingFile = async () => {
-    for (let shard = 0; shard < Math.max(1, bigQueryQueueShards); shard += 1) {
-        const pendingFile = getPendingFilePath(shard);
-
-        try {
-            const stat = await fs.promises.stat(pendingFile);
-
-            if (!stat.size) {
-                continue;
-            }
-
-            const readyFile = getReadyFilePath(`${Date.now()}-${shard}-${Math.random().toString(16).slice(2, 8)}`);
-            await fs.promises.rename(pendingFile, readyFile);
-            return readyFile;
-        } catch (error) {
-            if (error.code === "ENOENT") {
-                continue;
-            }
-        }
-    }
-
-    return null;
-};
-
-const recoverExpiredProcessingFiles = async () => {
-    const entries = await fs.promises.readdir(PROCESSING_DIR);
-    const now = Date.now();
-
-    for (const entry of entries) {
-        if (!entry.endsWith(".ndjson")) {
-            continue;
-        }
-
-        const filePath = path.join(PROCESSING_DIR, entry);
-        const stat = await fs.promises.stat(filePath).catch(() => null);
-
-        if (!stat) {
-            continue;
-        }
-
-        if ((now - stat.mtimeMs) < Math.max(1000, bigQueryWorkerLeaseMs)) {
-            continue;
-        }
-
-        const readyFile = getReadyFilePath(`recovered-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
-
-        try {
-            await fs.promises.rename(filePath, readyFile);
-            logWorker("warn", "bigquery-worker", "Recovered expired processing file", {
-                source: entry,
-            });
-        } catch (error) {
-            if (error.code !== "ENOENT") {
-                throw error;
-            }
-        }
-    }
-};
-
-const claimReadyFile = async () => {
-    const entries = (await fs.promises.readdir(READY_DIR))
-        .filter((entry) => entry.endsWith(".ndjson"))
-        .sort();
-
-    for (const entry of entries) {
-        const readyFile = path.join(READY_DIR, entry);
-        const processingFile = getProcessingFilePath(workerName, `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
-
-        try {
-            await fs.promises.rename(readyFile, processingFile);
-            return processingFile;
-        } catch (error) {
-            if (error.code === "ENOENT") {
-                continue;
-            }
-        }
-    }
-
-    return null;
-};
-
 const buildChunks = (items) => {
     const grouped = items.reduce((acc, item) => {
         if (!acc.has(item.tableName)) {
@@ -264,79 +147,125 @@ const buildChunks = (items) => {
     return chunks;
 };
 
-const processFile = async (filePath) => {
-    const items = await readQueueFile(filePath);
+const buildRetriedItem = (item, errorMessage) => ({
+    tableName: item.tableName,
+    row: item.row,
+    attempts: Number(item.attempts || 0) + 1,
+    lastError: errorMessage,
+    lastAttemptAt: new Date().toISOString(),
+});
 
+const splitRetryableItems = (items, errorMessage) => items.reduce((acc, item) => {
+    const attempts = Number(item.attempts || 0);
+
+    if ((attempts + 1) > Math.max(1, bigQueryMaxRetries)) {
+        acc.rejected.push({
+            item,
+            message: `${errorMessage} [max_retries_exceeded]`,
+        });
+        return acc;
+    }
+
+    acc.retryItems.push(buildRetriedItem(item, errorMessage));
+    return acc;
+}, { retryItems: [], rejected: [] });
+
+const logRejectedItems = async (rejectedItems, tableName) => {
+    if (!rejectedItems.length) {
+        return;
+    }
+
+    await rejectItems(
+        rejectedItems.map((rejected) => ({
+            tableName,
+            row: rejected.item.row,
+            rejectedAt: new Date().toISOString(),
+            attempts: Number(rejected.item.attempts || 0),
+            error: rejected.message,
+        }))
+    );
+
+    for (const rejected of rejectedItems) {
+        logInsertError(
+            { message: rejected.message, code: null },
+            rejected.item.row,
+            null,
+            null,
+            tableName
+        );
+    }
+};
+
+const processMessages = async (items) => {
     if (!items.length) {
-        await fs.promises.unlink(filePath).catch(() => {});
         return;
     }
 
     const chunks = buildChunks(items);
-    const remaining = [];
 
     for (let index = 0; index < chunks.length; index += 1) {
         const chunk = chunks[index];
+        const chunkMessageIds = chunk.items.map((item) => item.messageId);
 
         try {
             await insertBatch(
                 chunk.tableName,
                 chunk.items.map((item) => item.row)
             );
-            await touchFile(filePath);
+            await acknowledgeMessages(chunkMessageIds);
         } catch (error) {
             const failedInsertIds = new Set(getFailedInsertIds(error));
 
             if (failedInsertIds.size > 0) {
                 const chunkItemsByInsertId = getChunkItemByInsertId(chunk);
                 const rowErrors = getRowErrors(error);
+                const rowErrorByInsertId = rowErrors.reduce((acc, rowError) => {
+                    const insertId = rowError && rowError.row && rowError.row.insertId;
+                    if (insertId) {
+                        acc.set(insertId, rowError);
+                    }
+
+                    return acc;
+                }, new Map());
                 const retryItems = [];
                 const rejectedItems = [];
 
-                for (const rowError of rowErrors) {
-                    const insertId = rowError && rowError.row && rowError.row.insertId;
-                    if (!insertId) {
+                for (const item of chunk.items) {
+                    const insertId = item && item.row && item.row.event_hash;
+
+                    if (!insertId || !failedInsertIds.has(insertId)) {
                         continue;
                     }
 
-                    const failedItem = chunkItemsByInsertId.get(insertId);
-                    if (!failedItem) {
-                        continue;
-                    }
+                    const rowError = rowErrorByInsertId.get(insertId);
 
-                    if (isRetryableRowError(rowError)) {
-                        retryItems.push(failedItem);
+                    if (rowError && isRetryableRowError(rowError)) {
+                        const retrySplit = splitRetryableItems(
+                            [chunkItemsByInsertId.get(insertId)],
+                            buildRowErrorMessage(error, rowError)
+                        );
+                        retryItems.push(...retrySplit.retryItems);
+                        rejectedItems.push(...retrySplit.rejected);
                         continue;
                     }
 
                     rejectedItems.push({
-                        item: failedItem,
+                        item: chunkItemsByInsertId.get(insertId),
                         message: buildRowErrorMessage(error, rowError),
                     });
                 }
 
+                if (retryItems.length > 0) {
+                    await requeueItems(retryItems);
+                    logWorker("warn", "bigquery-worker-retry", "Re-queued retryable rows after partial BigQuery failure", {
+                        tableName: chunk.tableName,
+                        count: retryItems.length,
+                        reason: error.message,
+                    });
+                    await sleep(Math.max(1000, bigQueryRetryDelayMs));
+                }
+
                 if (rejectedItems.length > 0) {
-                    const rejectedFile = getRejectedFilePath(`${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
-                    await appendQueueFile(
-                        rejectedFile,
-                        rejectedItems.map((rejected) => ({
-                            tableName: chunk.tableName,
-                            row: rejected.item.row,
-                            rejectedAt: new Date().toISOString(),
-                            error: rejected.message,
-                        }))
-                    );
-
-                    for (const rejected of rejectedItems) {
-                        logInsertError(
-                            { message: rejected.message, code: error.code || null },
-                            rejected.item.row,
-                            null,
-                            null,
-                            chunk.tableName
-                        );
-                    }
-
                     logWorker("warn", "bigquery-worker-drop", "Dropped rows rejected by BigQuery", {
                         tableName: chunk.tableName,
                         count: rejectedItems.length,
@@ -344,52 +273,30 @@ const processFile = async (filePath) => {
                     });
                 }
 
-                if (retryItems.length > 0) {
-                    remaining.push(...retryItems);
-
-                    for (let pendingIndex = index + 1; pendingIndex < chunks.length; pendingIndex += 1) {
-                        remaining.push(...chunks[pendingIndex].items);
-                    }
-
-                    const readyFile = getReadyFilePath(`retry-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
-                    await writeQueueFile(readyFile, remaining);
-                    await fs.promises.unlink(filePath).catch(() => {});
-
-                    logWorker("warn", "bigquery-worker-retry", "Re-queued retryable rows after partial BigQuery failure", {
-                        tableName: chunk.tableName,
-                        count: retryItems.length,
-                        reason: error.message,
-                    });
-
-                    await sleep(Math.max(1000, bigQueryRetryDelayMs));
-                    return;
-                }
+                await logRejectedItems(rejectedItems, chunk.tableName);
+                await acknowledgeMessages(chunkMessageIds);
 
                 continue;
             }
 
-            remaining.push(...chunk.items);
+            const retrySplit = splitRetryableItems(chunk.items, error.message);
 
-            for (let pendingIndex = index + 1; pendingIndex < chunks.length; pendingIndex += 1) {
-                remaining.push(...chunks[pendingIndex].items);
+            if (retrySplit.retryItems.length > 0) {
+                await requeueItems(retrySplit.retryItems);
             }
 
-            const readyFile = getReadyFilePath(`retry-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`);
-            await writeQueueFile(readyFile, remaining);
-            await fs.promises.unlink(filePath).catch(() => {});
+            await logRejectedItems(retrySplit.rejected, chunk.tableName);
+            await acknowledgeMessages(chunkMessageIds);
 
-            logWorker("error", "bigquery-worker", "BigQuery insert failed; re-queued file chunk", {
+            logWorker("error", "bigquery-worker", "BigQuery insert failed; re-queued stream chunk", {
                 tableName: chunk.tableName,
-                count: remaining.length,
+                count: chunk.items.length,
                 reason: error.message,
             });
 
             await sleep(Math.max(1000, bigQueryRetryDelayMs));
-            return;
         }
     }
-
-    await fs.promises.unlink(filePath).catch(() => {});
 };
 
 const startWorker = async () => {
@@ -397,26 +304,33 @@ const startWorker = async () => {
         throw new Error("BigQuery is not fully configured");
     }
 
-    await ensureQueueDir();
-    logWorker("info", "bigquery-worker", "BigQuery file worker started");
+    await ensureQueueReady();
+    logWorker("info", "bigquery-worker", "BigQuery Redis worker started");
 
     while (!stopping) {
         try {
-            await recoverExpiredProcessingFiles();
+            const reclaimedItems = await claimPendingBatch(
+                workerName,
+                Math.max(1, bigQueryBatchSize),
+                Math.max(1000, bigQueryWorkerLeaseMs)
+            );
 
-            let filePath = await claimReadyFile();
-
-            if (!filePath) {
-                await rotatePendingFile();
-                filePath = await claimReadyFile();
-            }
-
-            if (!filePath) {
-                await sleep(Math.max(250, bigQueryWorkerPollMs));
+            if (reclaimedItems.length > 0) {
+                await processMessages(reclaimedItems);
                 continue;
             }
 
-            await processFile(filePath);
+            const items = await readQueueBatch(
+                workerName,
+                Math.max(1, bigQueryBatchSize),
+                Math.max(250, bigQueryWorkerPollMs)
+            );
+
+            if (!items.length) {
+                continue;
+            }
+
+            await processMessages(items);
         } catch (error) {
             logWorker("error", "bigquery-worker", "Worker loop failed", {
                 reason: error.message,

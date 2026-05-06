@@ -1,7 +1,7 @@
 ﻿// src/routes/health.route.js
 
 const express = require("express");
-const { getQueueStats } = require("../services/bigquery-queue.service");
+const { getQueueStats } = require("../services/redis-queue.service");
 
 const router = express.Router();
 
