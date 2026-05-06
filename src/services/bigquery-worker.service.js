@@ -2,6 +2,7 @@ const os = require("os");
 
 const {
     bigQueryBatchSize,
+    bigQueryQueueReadBatch,
     bigQueryMaxRetries,
     bigQueryRetryDelayMs,
     bigQueryErrorLogIntervalMs,
@@ -309,9 +310,11 @@ const startWorker = async () => {
 
     while (!stopping) {
         try {
+            const readBatchSize = Math.max(1, bigQueryQueueReadBatch);
+
             const reclaimedItems = await claimPendingBatch(
                 workerName,
-                Math.max(1, bigQueryBatchSize),
+                readBatchSize,
                 Math.max(1000, bigQueryWorkerLeaseMs)
             );
 
@@ -322,7 +325,7 @@ const startWorker = async () => {
 
             const items = await readQueueBatch(
                 workerName,
-                Math.max(1, bigQueryBatchSize),
+                readBatchSize,
                 Math.max(250, bigQueryWorkerPollMs)
             );
 

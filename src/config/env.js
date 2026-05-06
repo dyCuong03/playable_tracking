@@ -30,6 +30,7 @@ module.exports = {
     bigQueryDataset: process.env.BIGQUERY_DATASET || "",
     bigQueryTable: process.env.BIGQUERY_TABLE || "",
     bigQueryBatchSize: parseNumber(process.env.BIGQUERY_BATCH_SIZE, 100),
+    bigQueryQueueReadBatch: parseNumber(process.env.BIGQUERY_QUEUE_READ_BATCH, 1000),
     bigQueryMaxRetries: parseNumber(process.env.BIGQUERY_MAX_RETRIES, 5),
     bigQueryRetryDelayMs: parseNumber(process.env.BIGQUERY_RETRY_DELAY_MS, 30_000),
     bigQueryErrorLogIntervalMs: parseNumber(process.env.BIGQUERY_ERROR_LOG_INTERVAL_MS, 10_000),
