@@ -6,6 +6,7 @@ echo "DEPLOY NODE.JS PIXEL SERVER (PROD)"
 echo "======================================"
 
 SERVER_APP_PREFIX="pixel-server"
+LEGACY_SERVER_APP_NAME="pixel-server"
 WORKER_APP_NAME_PREFIX="pixel-worker"
 REDIS_APP_NAME="pixel-redis"
 NGINX_APP_NAME="pixel-nginx"
@@ -81,6 +82,10 @@ fi
 
 if docker ps -a --format '{{.Names}}' | grep -q "^${NGINX_APP_NAME}$"; then
   docker rm -f "$NGINX_APP_NAME"
+fi
+
+if docker ps -a --format '{{.Names}}' | grep -q "^${LEGACY_SERVER_APP_NAME}$"; then
+  docker rm -f "$LEGACY_SERVER_APP_NAME"
 fi
 
 for i in $(seq 1 "$APP_REPLICAS"); do
