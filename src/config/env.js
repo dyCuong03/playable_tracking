@@ -25,7 +25,6 @@ module.exports = {
     PORT: process.env.PORT || 8080,
     NODE_ENV: process.env.NODE_ENV || "development",
     webConcurrency: parseNumber(process.env.WEB_CONCURRENCY, 0),
-    trackingResponseMode: process.env.TRACKING_RESPONSE_MODE || "empty",
     trustProxy: true,
     bigQueryEnabled: parseBoolean(process.env.BIGQUERY_ENABLED, false),
     bigQueryDataset: process.env.BIGQUERY_DATASET || "",

@@ -8,7 +8,6 @@ echo "======================================"
 SERVER_APP_PREFIX="pixel-server"
 LEGACY_SERVER_APP_NAME="pixel-server"
 WORKER_APP_NAME_PREFIX="pixel-worker"
-LEGACY_WORKER_APP_NAME="pixel-worker"
 REDIS_APP_NAME="pixel-redis"
 NGINX_APP_NAME="pixel-nginx"
 NETWORK_NAME="pixel-server-net"
@@ -18,7 +17,6 @@ CONTAINER_PORT=9000
 WORKER_COUNT="${WORKER_COUNT:-2}"
 APP_REPLICAS="${APP_REPLICAS:-4}"
 WEB_CONCURRENCY="${WEB_CONCURRENCY:-4}"
-TRACKING_RESPONSE_MODE="${TRACKING_RESPONSE_MODE:-empty}"
 QUEUE_ROOT_DIR="$(pwd)/data"
 QUEUE_DIR_IN_CONTAINER="${BIGQUERY_QUEUE_DIR:-data/bigquery-queue}"
 BIGQUERY_ENABLED="${BIGQUERY_ENABLED:-true}"
@@ -91,10 +89,6 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${LEGACY_SERVER_APP_NAME}$"; t
   docker rm -f "$LEGACY_SERVER_APP_NAME"
 fi
 
-if docker ps -a --format '{{.Names}}' | grep -q "^${LEGACY_WORKER_APP_NAME}$"; then
-  docker rm -f "$LEGACY_WORKER_APP_NAME"
-fi
-
 for i in $(seq 1 "$APP_REPLICAS"); do
   SERVER_APP_NAME="${SERVER_APP_PREFIX}-${i}"
   if docker ps -a --format '{{.Names}}' | grep -q "^${SERVER_APP_NAME}$"; then
@@ -117,7 +111,6 @@ docker run -d \
   --name "$REDIS_APP_NAME" \
   --restart always \
   --network "$NETWORK_NAME" \
-  --ulimit nofile=200000:200000 \
   redis:7-alpine \
   redis-server --save "" --appendonly no
 
@@ -140,11 +133,9 @@ for i in $(seq 1 "$APP_REPLICAS"); do
     --name "$SERVER_APP_NAME" \
     --restart always \
     --network "$NETWORK_NAME" \
-    --ulimit nofile=200000:200000 \
     -e NODE_ENV=production \
     -e PORT=${CONTAINER_PORT} \
     -e WEB_CONCURRENCY=${WEB_CONCURRENCY} \
-    -e TRACKING_RESPONSE_MODE=${TRACKING_RESPONSE_MODE} \
     -e BIGQUERY_ENABLED=${BIGQUERY_ENABLED} \
     -e BIGQUERY_DATASET=${BIGQUERY_DATASET} \
     -e BIGQUERY_TABLE=${BIGQUERY_TABLE} \
@@ -172,7 +163,6 @@ docker run -d \
   --name "$NGINX_APP_NAME" \
   --restart always \
   --network "$NETWORK_NAME" \
-  --ulimit nofile=200000:200000 \
   -p ${HOST_PORT}:${CONTAINER_PORT} \
   -v "${NGINX_CONFIG_RENDERED}":/etc/nginx/nginx.conf:ro \
   nginx:1.27-alpine
@@ -183,8 +173,6 @@ for i in $(seq 1 "$WORKER_COUNT"); do
     --name "$WORKER_NAME" \
     --restart always \
     --network "$NETWORK_NAME" \
-    --ulimit nofile=200000:200000 \
-    --no-healthcheck \
     -e NODE_ENV=production \
     -e BIGQUERY_ENABLED=${BIGQUERY_ENABLED} \
     -e BIGQUERY_DATASET=${BIGQUERY_DATASET} \
