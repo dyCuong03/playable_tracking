@@ -305,11 +305,12 @@ const startWorker = async () => {
         throw new Error("BigQuery is not fully configured");
     }
 
-    await ensureQueueReady();
     logWorker("info", "bigquery-worker", "BigQuery Redis worker started");
 
     while (!stopping) {
         try {
+            await ensureQueueReady();
+
             const readBatchSize = Math.max(1, bigQueryQueueReadBatch);
 
             const reclaimedItems = await claimPendingBatch(

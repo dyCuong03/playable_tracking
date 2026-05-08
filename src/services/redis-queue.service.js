@@ -5,13 +5,41 @@ const {
     redisQueueGroup,
     redisRejectedStream,
     redisQueueMaxLen,
+    redisConnectTimeoutMs,
+    redisCommandTimeoutMs,
+    redisUnavailableCooldownMs,
+    redisErrorLogIntervalMs,
 } = require("../config");
 
 let client;
 let clientPromise;
 let consumerGroupPromise;
+let redisUnavailableUntil = 0;
+let lastRedisErrorLogAt = 0;
+
+const withTimeout = (promise, timeoutMs, message) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+        reject(new Error(message));
+    }, timeoutMs);
+
+    promise
+        .then((value) => {
+            clearTimeout(timer);
+            resolve(value);
+        })
+        .catch((error) => {
+            clearTimeout(timer);
+            reject(error);
+        });
+});
 
 const logRedisError = (error) => {
+    const now = Date.now();
+    if ((now - lastRedisErrorLogAt) < redisErrorLogIntervalMs) {
+        return;
+    }
+
+    lastRedisErrorLogAt = now;
     console.error(JSON.stringify({
         level: "error",
         type: "redis-queue",
@@ -19,25 +47,64 @@ const logRedisError = (error) => {
     }));
 };
 
+const resetClientState = () => {
+    consumerGroupPromise = null;
+    clientPromise = null;
+
+    if (!client) {
+        return;
+    }
+
+    const currentClient = client;
+    client = null;
+
+    try {
+        currentClient.removeAllListeners("error");
+        if (currentClient.isOpen) {
+            currentClient.disconnect();
+        }
+    } catch (_) {
+        // Ignore disconnect errors while entering degraded mode.
+    }
+};
+
+const markRedisUnavailable = (error) => {
+    redisUnavailableUntil = Date.now() + redisUnavailableCooldownMs;
+    resetClientState();
+
+    if (error) {
+        logRedisError(error);
+    }
+};
+
 const getClient = async () => {
     if (client && client.isOpen) {
         return client;
+    }
+
+    if (Date.now() < redisUnavailableUntil) {
+        throw new Error("Redis queue temporarily unavailable");
     }
 
     if (!clientPromise) {
         client = createClient({
             url: redisUrl,
             socket: {
-                reconnectStrategy: (retries) => Math.min(retries * 100, 3000),
+                connectTimeout: Math.max(100, redisConnectTimeoutMs),
+                reconnectStrategy: false,
             },
         });
 
         client.on("error", logRedisError);
 
-        clientPromise = client.connect()
+        clientPromise = withTimeout(
+            client.connect(),
+            Math.max(100, redisConnectTimeoutMs),
+            `Redis connect timed out after ${redisConnectTimeoutMs}ms`
+        )
             .then(() => client)
             .catch((error) => {
-                clientPromise = null;
+                markRedisUnavailable(error);
                 throw error;
             });
     }
@@ -47,7 +114,15 @@ const getClient = async () => {
 
 const sendRedisCommand = async (args) => {
     const queueClient = await getClient();
-    return queueClient.sendCommand(args.map((value) => String(value)));
+
+    return withTimeout(
+        queueClient.sendCommand(args.map((value) => String(value))),
+        Math.max(100, redisCommandTimeoutMs),
+        `Redis command timed out after ${redisCommandTimeoutMs}ms`
+    ).catch((error) => {
+        markRedisUnavailable(error);
+        throw error;
+    });
 };
 
 const encodeItem = (item) => JSON.stringify({
@@ -123,6 +198,21 @@ const appendToStream = async (streamName, item) => sendRedisCommand([
 const enqueueEvent = async (queueItem) => {
     await ensureQueueReady();
     return appendToStream(redisQueueStream, queueItem);
+};
+
+const enqueueEventBatch = async (items) => {
+    if (!items.length) {
+        return [];
+    }
+
+    await ensureQueueReady();
+
+    const results = [];
+    for (let index = 0; index < items.length; index += 1) {
+        results.push(await appendToStream(redisQueueStream, items[index]));
+    }
+
+    return results;
 };
 
 const requeueItems = async (items) => {
@@ -239,6 +329,7 @@ const getQueueStats = async () => {
 module.exports = {
     ensureQueueReady,
     enqueueEvent,
+    enqueueEventBatch,
     requeueItems,
     rejectItems,
     readQueueBatch,

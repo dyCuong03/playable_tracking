@@ -1,32 +1,38 @@
 const cluster = require("cluster");
-const os = require("os");
 const app = require("./app");
+const {
+    startDispatcher,
+    stopDispatcher,
+} = require("./services/request-dispatcher.service");
 const {
     PORT,
     webConcurrency,
 } = require("./config");
 
-const resolveWorkerCount = () => {
-    if (webConcurrency > 0) {
-        return Math.max(1, webConcurrency);
-    }
-
-    if (typeof os.availableParallelism === "function") {
-        return Math.max(1, os.availableParallelism());
-    }
-
-    return Math.max(1, os.cpus().length);
-};
+const resolveWorkerCount = () => Math.max(1, webConcurrency);
 
 const startHttpServer = () => {
+    startDispatcher().catch((error) => {
+        console.error(`Request dispatcher failed: ${error.message}`);
+    });
+
     app.listen(PORT, () => {
         console.log(`Pixel server running on port ${PORT} (pid: ${process.pid})`);
     });
 };
 
-if (cluster.isPrimary) {
-    const workerCount = resolveWorkerCount();
+const workerCount = resolveWorkerCount();
 
+const shutdown = () => {
+    stopDispatcher();
+    process.exit(0);
+};
+
+if (workerCount <= 1) {
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    startHttpServer();
+} else if (cluster.isPrimary) {
     console.log(`Starting pixel server cluster with ${workerCount} workers`);
 
     for (let index = 0; index < workerCount; index += 1) {
@@ -38,5 +44,7 @@ if (cluster.isPrimary) {
         cluster.fork();
     });
 } else {
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
     startHttpServer();
 }

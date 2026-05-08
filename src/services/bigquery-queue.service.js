@@ -35,8 +35,10 @@ const getPendingFilePath = (shard) => path.join(PENDING_DIR, `pending-${shard}.n
 
 const getReadyFilePath = (suffix) => path.join(READY_DIR, `ready-${suffix}.ndjson`);
 
-const getProcessingFilePath = (workerName, suffix) => path.join(PROCESSING_DIR, `processing-${workerName}-${suffix}.ndjson`);
+const getProcessingFilePath = (workerName, suffix) => path.join(PROCESSING_DIR, `processing--${workerName}--${suffix}`);
 const getRejectedFilePath = (suffix) => path.join(REJECTED_DIR, `rejected-${suffix}.ndjson`);
+
+const getFileSuffix = () => `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
 
 const getDirectoryStats = async (dirPath) => {
     const entries = await fs.promises.readdir(dirPath).catch(() => []);
@@ -102,6 +104,115 @@ const enqueueEvent = async (queueItem) => {
     return true;
 };
 
+const rotatePendingShard = async (shard) => {
+    await ensureQueueDir();
+
+    const targetFile = getPendingFilePath(shard);
+    const chain = appendChains.get(targetFile) || Promise.resolve();
+    const rotation = chain.catch(() => {}).then(async () => {
+        const stat = await fs.promises.stat(targetFile).catch(() => null);
+
+        if (!stat || stat.size === 0) {
+            return null;
+        }
+
+        const readyFile = getReadyFilePath(getFileSuffix());
+        await fs.promises.rename(targetFile, readyFile);
+        return readyFile;
+    });
+
+    appendChains.set(targetFile, rotation.catch(() => {}));
+    return rotation;
+};
+
+const rotatePendingFiles = async () => {
+    const shardCount = Math.max(1, bigQueryQueueShards);
+    const rotated = await Promise.all(
+        Array.from({ length: shardCount }, (_, shard) => rotatePendingShard(shard))
+    );
+
+    return rotated.filter(Boolean);
+};
+
+const listReadyFiles = async () => {
+    await ensureQueueDir();
+
+    const entries = await fs.promises.readdir(READY_DIR).catch(() => []);
+    return entries
+        .filter((entry) => entry.endsWith(".ndjson"))
+        .sort()
+        .map((entry) => path.join(READY_DIR, entry));
+};
+
+const claimReadyFile = async (workerName) => {
+    const readyFiles = await listReadyFiles();
+
+    for (let index = 0; index < readyFiles.length; index += 1) {
+        const readyFile = readyFiles[index];
+        const suffix = path.basename(readyFile).replace(/^ready-/, "");
+        const processingFile = getProcessingFilePath(workerName, suffix);
+
+        try {
+            await fs.promises.rename(readyFile, processingFile);
+            return processingFile;
+        } catch (error) {
+            if (error && error.code === "ENOENT") {
+                continue;
+            }
+
+            throw error;
+        }
+    }
+
+    return null;
+};
+
+const parseQueueFile = async (filePath) => {
+    const content = await fs.promises.readFile(filePath, "utf8");
+
+    return content
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+};
+
+const completeProcessingFile = async (processingFile) => {
+    await fs.promises.unlink(processingFile).catch((error) => {
+        if (error && error.code !== "ENOENT") {
+            throw error;
+        }
+    });
+};
+
+const releaseProcessingFile = async (processingFile) => {
+    const basename = path.basename(processingFile);
+    const marker = "--";
+    const markerIndex = basename.indexOf(marker, "processing--".length);
+    const rawSuffix = markerIndex >= 0
+        ? basename.slice(markerIndex + marker.length)
+        : basename.replace(/^processing-/, "");
+    const suffix = rawSuffix.endsWith(".ndjson")
+        ? rawSuffix.slice(0, -".ndjson".length)
+        : rawSuffix;
+    const readyFile = getReadyFilePath(`${Date.now()}-${suffix}`);
+
+    await fs.promises.rename(processingFile, readyFile);
+    return readyFile;
+};
+
+const resetQueueState = async () => {
+    appendChains.clear();
+    ensurePromise = null;
+    nextShard = 0;
+    await fs.promises.rm(BASE_DIR, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+    });
+};
+
 module.exports = {
     enqueueEvent,
     ensureQueueDir,
@@ -111,6 +222,12 @@ module.exports = {
     getProcessingFilePath,
     getRejectedFilePath,
     getQueueStats,
+    rotatePendingFiles,
+    claimReadyFile,
+    parseQueueFile,
+    completeProcessingFile,
+    releaseProcessingFile,
+    resetQueueState,
     BASE_DIR,
     PENDING_DIR,
     READY_DIR,
