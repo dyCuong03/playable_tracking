@@ -18,6 +18,7 @@ let redisUnavailableUntil = 0;
 let lastRedisErrorLogAt = 0;
 
 const isBusyGroupError = (error) => String(error && error.message ? error.message : "").includes("BUSYGROUP");
+const normalizeRedisArgs = (args) => args.map((value) => String(value));
 
 const withTimeout = (promise, timeoutMs, message) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -123,7 +124,7 @@ const executeRedisCommand = async (args, options = {}) => {
     const queueClient = await getClient();
 
     return withTimeout(
-        queueClient.sendCommand(args.map((value) => String(value))),
+        queueClient.sendCommand(normalizeRedisArgs(args)),
         timeoutMs,
         timeoutMessage
     ).catch((error) => {
@@ -242,7 +243,7 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
             "*",
             "payload",
             encodeItem(items[index]),
-        ]);
+        ].map((value) => String(value)));
     }
 
     return withTimeout(
@@ -354,8 +355,8 @@ const acknowledgeMessages = async (messageIds) => {
         Math.min(30_000, Math.max(1, messageIds.length) * 10)
     );
 
-    pipeline.addCommand(["XACK", redisQueueStream, redisQueueGroup, ...messageIds]);
-    pipeline.addCommand(["XDEL", redisQueueStream, ...messageIds]);
+    pipeline.addCommand(normalizeRedisArgs(["XACK", redisQueueStream, redisQueueGroup, ...messageIds]));
+    pipeline.addCommand(normalizeRedisArgs(["XDEL", redisQueueStream, ...messageIds]));
 
     await withTimeout(
         pipeline.execAsPipeline(),
