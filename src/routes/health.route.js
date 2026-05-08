@@ -2,7 +2,7 @@
 
 const express = require("express");
 const { getQueueStats } = require("../services/redis-queue.service");
-const { getDispatcherStats } = require("../services/request-dispatcher.service");
+const { getDispatcherSummary } = require("../services/request-dispatcher.service");
 
 const router = express.Router();
 const QUEUE_STATS_TIMEOUT_MS = 500;
@@ -25,7 +25,7 @@ const withTimeout = (promise, timeoutMs) => new Promise((resolve, reject) => {
 
 router.get("/health", async (req, res) => {
     const includeQueueStats = ["1", "true", "yes"].includes(String(req.query.queue || "").toLowerCase());
-    const dispatcher = await getDispatcherStats().catch((error) => ({
+    const dispatcher = await getDispatcherSummary().catch((error) => ({
         ok: false,
         error: error.message,
     }));

@@ -60,14 +60,26 @@ const flushItemsToRedis = async (items) => {
     }
 };
 
+const getApproximateItemCount = (stats) => {
+    const bytes = (
+        stats.pending.totalBytes +
+        stats.ready.totalBytes +
+        stats.processing.totalBytes
+    );
+
+    return Math.max(0, Math.floor(bytes / 450));
+};
+
 const runBridgeLoop = async () => {
     while (!stopping) {
+        let claimedFile = null;
         let processingFile = null;
 
         try {
             await rotatePendingFiles();
 
-            processingFile = await claimReadyFile(workerName);
+            claimedFile = await claimReadyFile(workerName);
+            processingFile = claimedFile ? claimedFile.processingFile : null;
             bridgeState.processingFile = processingFile;
 
             if (!processingFile) {
@@ -85,7 +97,10 @@ const runBridgeLoop = async () => {
             bridgeState.lastSuccessAt = new Date().toISOString();
         } catch (error) {
             if (processingFile) {
-                await releaseProcessingFile(processingFile).catch(() => {});
+                await releaseProcessingFile(
+                    processingFile,
+                    claimedFile && claimedFile.readyFile ? claimedFile.readyFile : null
+                ).catch(() => {});
             }
 
             logBridgeError("Failed to dispatch durable queue to Redis", error, {
@@ -129,9 +144,25 @@ const getDispatcherStats = async () => ({
     durableQueue: await getQueueStats(),
 });
 
+const getDispatcherSummary = async () => {
+    const durableQueue = await getQueueStats();
+
+    return {
+        bridge: {
+            running: bridgeState.running,
+            processingFile: bridgeState.processingFile,
+            lastSuccessAt: bridgeState.lastSuccessAt,
+            worker: workerName,
+        },
+        durableQueue,
+        approxItems: getApproximateItemCount(durableQueue),
+    };
+};
+
 module.exports = {
     persistRequest,
     startDispatcher,
     stopDispatcher,
     getDispatcherStats,
+    getDispatcherSummary,
 };

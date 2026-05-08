@@ -1,23 +1,20 @@
 const cluster = require("cluster");
 const app = require("./app");
-const {
-    startDispatcher,
-    stopDispatcher,
-} = require("./services/request-dispatcher.service");
+const { stopDispatcher } = require("./services/request-dispatcher.service");
 const {
     PORT,
     webConcurrency,
+    requestQueueBridgeEnabled,
 } = require("./config");
 
 const resolveWorkerCount = () => Math.max(1, webConcurrency);
 
 const startHttpServer = () => {
-    startDispatcher().catch((error) => {
-        console.error(`Request dispatcher failed: ${error.message}`);
-    });
-
     app.listen(PORT, () => {
         console.log(`Pixel server running on port ${PORT} (pid: ${process.pid})`);
+        if (requestQueueBridgeEnabled) {
+            console.warn("REQUEST_QUEUE_BRIDGE_ENABLED is true in web server; prefer dedicated dispatcher worker");
+        }
     });
 };
 

@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
@@ -35,7 +36,16 @@ const getPendingFilePath = (shard) => path.join(PENDING_DIR, `pending-${shard}.n
 
 const getReadyFilePath = (suffix) => path.join(READY_DIR, `ready-${suffix}.ndjson`);
 
-const getProcessingFilePath = (workerName, suffix) => path.join(PROCESSING_DIR, `processing--${workerName}--${suffix}`);
+const getProcessingToken = (workerName, readyFile) => {
+    const basename = path.basename(readyFile);
+    const hash = crypto.createHash("sha1").update(basename).digest("hex").slice(0, 12);
+    return `${workerName}-${hash}`;
+};
+
+const getProcessingFilePath = (workerName, readyFile) => path.join(
+    PROCESSING_DIR,
+    `processing--${getProcessingToken(workerName, readyFile)}.ndjson`
+);
 const getRejectedFilePath = (suffix) => path.join(REJECTED_DIR, `rejected-${suffix}.ndjson`);
 
 const getFileSuffix = () => `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2, 10)}`;
@@ -149,12 +159,14 @@ const claimReadyFile = async (workerName) => {
 
     for (let index = 0; index < readyFiles.length; index += 1) {
         const readyFile = readyFiles[index];
-        const suffix = path.basename(readyFile).replace(/^ready-/, "");
-        const processingFile = getProcessingFilePath(workerName, suffix);
+        const processingFile = getProcessingFilePath(workerName, readyFile);
 
         try {
             await fs.promises.rename(readyFile, processingFile);
-            return processingFile;
+            return {
+                readyFile,
+                processingFile,
+            };
         } catch (error) {
             if (error && error.code === "ENOENT") {
                 continue;
@@ -185,17 +197,10 @@ const completeProcessingFile = async (processingFile) => {
     });
 };
 
-const releaseProcessingFile = async (processingFile) => {
-    const basename = path.basename(processingFile);
-    const marker = "--";
-    const markerIndex = basename.indexOf(marker, "processing--".length);
-    const rawSuffix = markerIndex >= 0
-        ? basename.slice(markerIndex + marker.length)
-        : basename.replace(/^processing-/, "");
-    const suffix = rawSuffix.endsWith(".ndjson")
-        ? rawSuffix.slice(0, -".ndjson".length)
-        : rawSuffix;
-    const readyFile = getReadyFilePath(`${Date.now()}-${suffix}`);
+const releaseProcessingFile = async (processingFile, readyFile) => {
+    if (!readyFile) {
+        return null;
+    }
 
     await fs.promises.rename(processingFile, readyFile);
     return readyFile;

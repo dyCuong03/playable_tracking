@@ -55,6 +55,7 @@ module.exports = {
     requestQueueDropLogIntervalMs: parseNumber(process.env.REQUEST_QUEUE_DROP_LOG_INTERVAL_MS, 10_000),
     requestQueueBridgePollMs: parseNumber(process.env.REQUEST_QUEUE_BRIDGE_POLL_MS, 250),
     requestQueueBridgeBatchSize: parseNumber(process.env.REQUEST_QUEUE_BRIDGE_BATCH_SIZE, 500),
+    requestQueueBridgeEnabled: parseBoolean(process.env.REQUEST_QUEUE_BRIDGE_ENABLED, false),
     rateLimitWindowMs: parseNumber(process.env.RATE_LIMIT_WINDOW_MS, 10_000),
     rateLimitMax: parseNumber(process.env.RATE_LIMIT_MAX, 200),
     rateLimitPrefix: process.env.RATE_LIMIT_PREFIX || "rate_limit:p.gif",

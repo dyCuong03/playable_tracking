@@ -20,5 +20,14 @@ module.exports = {
                 NODE_ENV: "production",
             },
         },
+        {
+            name: "pixel-dispatcher",
+            script: "src/dispatcher.js",
+            instances: 1,
+            exec_mode: "fork",
+            env: {
+                NODE_ENV: "production",
+            },
+        },
     ],
 };

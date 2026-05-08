@@ -8,6 +8,7 @@ echo "======================================"
 SERVER_APP_PREFIX="pixel-server"
 LEGACY_SERVER_APP_NAME="pixel-server"
 WORKER_APP_NAME_PREFIX="pixel-worker"
+DISPATCHER_APP_NAME_PREFIX="pixel-dispatcher"
 REDIS_APP_NAME="pixel-redis"
 NGINX_APP_NAME="pixel-nginx"
 NETWORK_NAME="pixel-server-net"
@@ -15,6 +16,7 @@ IMAGE_NAME="pixel-server:latest"
 HOST_PORT=9000
 CONTAINER_PORT=9000
 WORKER_COUNT="${WORKER_COUNT:-2}"
+DISPATCHER_COUNT="${DISPATCHER_COUNT:-1}"
 APP_REPLICAS="${APP_REPLICAS:-4}"
 WEB_CONCURRENCY="${WEB_CONCURRENCY:-1}"
 QUEUE_ROOT_DIR="$(pwd)/data"
@@ -100,6 +102,13 @@ for i in $(seq 1 "$WORKER_COUNT"); do
   WORKER_NAME="${WORKER_APP_NAME_PREFIX}-${i}"
   if docker ps -a --format '{{.Names}}' | grep -q "^${WORKER_NAME}$"; then
     docker rm -f "$WORKER_NAME"
+  fi
+done
+
+for i in $(seq 1 "$DISPATCHER_COUNT"); do
+  DISPATCHER_NAME="${DISPATCHER_APP_NAME_PREFIX}-${i}"
+  if docker ps -a --format '{{.Names}}' | grep -q "^${DISPATCHER_NAME}$"; then
+    docker rm -f "$DISPATCHER_NAME"
   fi
 done
 
@@ -212,6 +221,29 @@ for i in $(seq 1 "$WORKER_COUNT"); do
     -v "$KEY_FILE":/app/credentials/pixel-writer-key.json:ro \
     "$IMAGE_NAME" \
     node src/worker.js
+done
+
+for i in $(seq 1 "$DISPATCHER_COUNT"); do
+  DISPATCHER_NAME="${DISPATCHER_APP_NAME_PREFIX}-${i}"
+  docker run -d \
+    --name "$DISPATCHER_NAME" \
+    --restart always \
+    --network "$NETWORK_NAME" \
+    -e NODE_ENV=production \
+    -e BIGQUERY_QUEUE_DIR=${QUEUE_DIR_IN_CONTAINER} \
+    -e BIGQUERY_QUEUE_SHARDS=${BIGQUERY_QUEUE_SHARDS} \
+    -e BIGQUERY_ERROR_LOG_INTERVAL_MS=${BIGQUERY_ERROR_LOG_INTERVAL_MS} \
+    -e REQUEST_QUEUE_RETRY_DELAY_MS=${BIGQUERY_RETRY_DELAY_MS} \
+    -e REQUEST_QUEUE_BRIDGE_POLL_MS=${BIGQUERY_WORKER_POLL_MS} \
+    -e REQUEST_QUEUE_BRIDGE_BATCH_SIZE=${BIGQUERY_QUEUE_READ_BATCH} \
+    -e REDIS_URL=${REDIS_URL} \
+    -e REDIS_QUEUE_STREAM=${REDIS_QUEUE_STREAM} \
+    -e REDIS_QUEUE_GROUP=${REDIS_QUEUE_GROUP} \
+    -e REDIS_REJECTED_STREAM=${REDIS_REJECTED_STREAM} \
+    -e REDIS_QUEUE_MAXLEN=${REDIS_QUEUE_MAXLEN} \
+    -v "${QUEUE_ROOT_DIR}":/app/data \
+    "$IMAGE_NAME" \
+    node src/dispatcher.js
 done
 
 # =========================

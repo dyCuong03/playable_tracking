@@ -17,6 +17,8 @@ let consumerGroupPromise;
 let redisUnavailableUntil = 0;
 let lastRedisErrorLogAt = 0;
 
+const isBusyGroupError = (error) => String(error && error.message ? error.message : "").includes("BUSYGROUP");
+
 const withTimeout = (promise, timeoutMs, message) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
         reject(new Error(message));
@@ -112,7 +114,10 @@ const getClient = async () => {
     return clientPromise;
 };
 
-const sendRedisCommand = async (args) => {
+const executeRedisCommand = async (args, options = {}) => {
+    const {
+        markUnavailableOnError = true,
+    } = options;
     const queueClient = await getClient();
 
     return withTimeout(
@@ -120,10 +125,15 @@ const sendRedisCommand = async (args) => {
         Math.max(100, redisCommandTimeoutMs),
         `Redis command timed out after ${redisCommandTimeoutMs}ms`
     ).catch((error) => {
-        markRedisUnavailable(error);
+        if (markUnavailableOnError) {
+            markRedisUnavailable(error);
+        }
+
         throw error;
     });
 };
+
+const sendRedisCommand = async (args) => executeRedisCommand(args);
 
 const encodeItem = (item) => JSON.stringify({
     ...item,
@@ -169,9 +179,17 @@ const parseStreamEntries = (response) => {
 const ensureQueueReady = async () => {
     if (!consumerGroupPromise) {
         consumerGroupPromise = (async () => {
-            await sendRedisCommand(["XGROUP", "CREATE", redisQueueStream, redisQueueGroup, "0", "MKSTREAM"])
+            await executeRedisCommand(
+                ["XGROUP", "CREATE", redisQueueStream, redisQueueGroup, "0", "MKSTREAM"],
+                { markUnavailableOnError: false }
+            )
                 .catch((error) => {
-                    if (!String(error.message || "").includes("BUSYGROUP")) {
+                    if (isBusyGroupError(error)) {
+                        return;
+                    }
+
+                    markRedisUnavailable(error);
+                    if (!isBusyGroupError(error)) {
                         throw error;
                     }
                 });

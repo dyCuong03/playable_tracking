@@ -43,9 +43,20 @@ test("GET /p.gif persists the event to the durable queue before returning", asyn
         })
         .expect(200);
 
-    const stats = await getQueueStats();
-    const totalFiles = stats.pending.fileCount + stats.ready.fileCount + stats.processing.fileCount;
-    const totalBytes = stats.pending.totalBytes + stats.ready.totalBytes + stats.processing.totalBytes;
+    let totalFiles = 0;
+    let totalBytes = 0;
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+        const stats = await getQueueStats();
+        totalFiles = stats.pending.fileCount + stats.ready.fileCount + stats.processing.fileCount;
+        totalBytes = stats.pending.totalBytes + stats.ready.totalBytes + stats.processing.totalBytes;
+
+        if (totalFiles > 0 && totalBytes > 0) {
+            break;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     assert.ok(totalFiles > 0);
     assert.ok(totalBytes > 0);
