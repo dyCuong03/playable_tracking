@@ -58,7 +58,6 @@ module.exports = {
     requestQueueBridgeMaxFilesPerRun: parseNumber(process.env.REQUEST_QUEUE_BRIDGE_MAX_FILES_PER_RUN, 4),
     requestQueueRotateMinBytes: parseNumber(process.env.REQUEST_QUEUE_ROTATE_MIN_BYTES, 262_144),
     requestQueueRotateMaxAgeMs: parseNumber(process.env.REQUEST_QUEUE_ROTATE_MAX_AGE_MS, 1_000),
-    requestQueuePublishTimeoutMs: parseNumber(process.env.REQUEST_QUEUE_PUBLISH_TIMEOUT_MS, 150),
     requestQueueBridgeEnabled: parseBoolean(process.env.REQUEST_QUEUE_BRIDGE_ENABLED, false),
     rateLimitWindowMs: parseNumber(process.env.RATE_LIMIT_WINDOW_MS, 10_000),
     rateLimitMax: parseNumber(process.env.RATE_LIMIT_MAX, 200),

@@ -4,7 +4,6 @@ const {
     requestQueueBridgePollMs,
     requestQueueBridgeBatchSize,
     requestQueueBridgeMaxFilesPerRun,
-    requestQueuePublishTimeoutMs,
     requestQueueRetryDelayMs,
     bigQueryErrorLogIntervalMs,
 } = require("../config");
@@ -17,10 +16,7 @@ const {
     releaseProcessingFile,
     getQueueStats,
 } = require("./bigquery-queue.service");
-const {
-    enqueueEvent: enqueueRedisEvent,
-    enqueueEventBatch,
-} = require("./redis-queue.service");
+const { enqueueEventBatch } = require("./redis-queue.service");
 
 const workerName = `${os.hostname()}-${process.pid}`.replace(/[^a-zA-Z0-9_-]/g, "-");
 
@@ -54,37 +50,7 @@ const logBridgeError = (message, error, details = {}) => {
     }));
 };
 
-let lastDirectPublishErrorLogAt = 0;
-
-const logDirectPublishFallback = (error) => {
-    const now = Date.now();
-    if ((now - lastDirectPublishErrorLogAt) < bigQueryErrorLogIntervalMs) {
-        return;
-    }
-
-    lastDirectPublishErrorLogAt = now;
-    console.warn(JSON.stringify({
-        level: "warn",
-        type: "request-publish-fallback",
-        message: "Direct Redis publish failed; falling back to durable queue",
-        reason: error.message,
-        worker: workerName,
-    }));
-};
-
-const persistRequest = async (item) => {
-    try {
-        await enqueueRedisEvent(item, {
-            timeoutMs: Math.max(50, requestQueuePublishTimeoutMs),
-            timeoutMessage: `Direct Redis publish timed out after ${requestQueuePublishTimeoutMs}ms`,
-        });
-        return "redis";
-    } catch (error) {
-        logDirectPublishFallback(error);
-        await enqueueDiskEvent(item);
-        return "disk";
-    }
-};
+const persistRequest = async (item) => enqueueDiskEvent(item);
 
 const flushItemsToRedis = async (items) => {
     const batchSize = Math.max(1, requestQueueBridgeBatchSize);
