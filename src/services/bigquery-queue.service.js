@@ -5,6 +5,8 @@ const path = require("path");
 const {
     bigQueryQueueDir,
     bigQueryQueueShards,
+    requestQueueRotateMinBytes,
+    requestQueueRotateMaxAgeMs,
 } = require("../config");
 
 const BASE_DIR = path.resolve(process.cwd(), bigQueryQueueDir);
@@ -126,6 +128,14 @@ const rotatePendingShard = async (shard) => {
             return null;
         }
 
+        const fileAgeMs = Math.max(0, Date.now() - Number(stat.mtimeMs || 0));
+        const shouldRotateForSize = stat.size >= Math.max(1, requestQueueRotateMinBytes);
+        const shouldRotateForAge = fileAgeMs >= Math.max(0, requestQueueRotateMaxAgeMs);
+
+        if (!shouldRotateForSize && !shouldRotateForAge) {
+            return null;
+        }
+
         const readyFile = getReadyFilePath(getFileSuffix());
         await fs.promises.rename(targetFile, readyFile);
         return readyFile;
@@ -179,6 +189,23 @@ const claimReadyFile = async (workerName) => {
     return null;
 };
 
+const claimReadyFiles = async (workerName, limit) => {
+    const maxFiles = Math.max(1, limit);
+    const claimedFiles = [];
+
+    for (let index = 0; index < maxFiles; index += 1) {
+        const claimedFile = await claimReadyFile(workerName);
+
+        if (!claimedFile) {
+            break;
+        }
+
+        claimedFiles.push(claimedFile);
+    }
+
+    return claimedFiles;
+};
+
 const parseQueueFile = async (filePath) => {
     const content = await fs.promises.readFile(filePath, "utf8");
 
@@ -229,6 +256,7 @@ module.exports = {
     getQueueStats,
     rotatePendingFiles,
     claimReadyFile,
+    claimReadyFiles,
     parseQueueFile,
     completeProcessingFile,
     releaseProcessingFile,

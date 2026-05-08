@@ -117,13 +117,15 @@ const getClient = async () => {
 const executeRedisCommand = async (args, options = {}) => {
     const {
         markUnavailableOnError = true,
+        timeoutMs = Math.max(100, redisCommandTimeoutMs),
+        timeoutMessage = `Redis command timed out after ${timeoutMs}ms`,
     } = options;
     const queueClient = await getClient();
 
     return withTimeout(
         queueClient.sendCommand(args.map((value) => String(value))),
-        Math.max(100, redisCommandTimeoutMs),
-        `Redis command timed out after ${redisCommandTimeoutMs}ms`
+        timeoutMs,
+        timeoutMessage
     ).catch((error) => {
         if (markUnavailableOnError) {
             markRedisUnavailable(error);
@@ -213,6 +215,49 @@ const appendToStream = async (streamName, item) => sendRedisCommand([
     encodeItem(item),
 ]);
 
+const appendToStreamBatch = async (streamName, items, options = {}) => {
+    if (!items.length) {
+        return [];
+    }
+
+    const {
+        timeoutMs = Math.max(
+            Math.max(100, redisCommandTimeoutMs),
+            Math.min(30_000, Math.max(1, items.length) * 25)
+        ),
+        timeoutMessage = `Redis pipeline timed out after ${timeoutMs}ms`,
+        markUnavailableOnError = true,
+    } = options;
+
+    const queueClient = await getClient();
+    const pipeline = queueClient.MULTI();
+
+    for (let index = 0; index < items.length; index += 1) {
+        pipeline.addCommand([
+            "XADD",
+            streamName,
+            "MAXLEN",
+            "~",
+            Math.max(1000, redisQueueMaxLen),
+            "*",
+            "payload",
+            encodeItem(items[index]),
+        ]);
+    }
+
+    return withTimeout(
+        pipeline.execAsPipeline(),
+        timeoutMs,
+        timeoutMessage
+    ).catch((error) => {
+        if (markUnavailableOnError) {
+            markRedisUnavailable(error);
+        }
+
+        throw error;
+    });
+};
+
 const enqueueEvent = async (queueItem) => {
     await ensureQueueReady();
     return appendToStream(redisQueueStream, queueItem);
@@ -224,13 +269,7 @@ const enqueueEventBatch = async (items) => {
     }
 
     await ensureQueueReady();
-
-    const results = [];
-    for (let index = 0; index < items.length; index += 1) {
-        results.push(await appendToStream(redisQueueStream, items[index]));
-    }
-
-    return results;
+    return appendToStreamBatch(redisQueueStream, items);
 };
 
 const requeueItems = async (items) => {
@@ -239,7 +278,7 @@ const requeueItems = async (items) => {
     }
 
     await ensureQueueReady();
-    await Promise.all(items.map((item) => appendToStream(redisQueueStream, item)));
+    await appendToStreamBatch(redisQueueStream, items);
 };
 
 const rejectItems = async (items) => {
@@ -247,25 +286,36 @@ const rejectItems = async (items) => {
         return;
     }
 
-    await Promise.all(items.map((item) => appendToStream(redisRejectedStream, item)));
+    await appendToStreamBatch(redisRejectedStream, items);
 };
 
 const readQueueBatch = async (consumerName, count, blockMs) => {
     await ensureQueueReady();
+    const effectiveBlockMs = Math.max(0, blockMs);
+    const timeoutMs = Math.max(
+        Math.max(100, redisCommandTimeoutMs),
+        effectiveBlockMs + 1_000
+    );
 
-    const response = await sendRedisCommand([
-        "XREADGROUP",
-        "GROUP",
-        redisQueueGroup,
-        consumerName,
-        "COUNT",
-        Math.max(1, count),
-        "BLOCK",
-        Math.max(0, blockMs),
-        "STREAMS",
-        redisQueueStream,
-        ">",
-    ]);
+    const response = await executeRedisCommand(
+        [
+            "XREADGROUP",
+            "GROUP",
+            redisQueueGroup,
+            consumerName,
+            "COUNT",
+            Math.max(1, count),
+            "BLOCK",
+            effectiveBlockMs,
+            "STREAMS",
+            redisQueueStream,
+            ">",
+        ],
+        {
+            timeoutMs,
+            timeoutMessage: `Redis blocking read timed out after ${timeoutMs}ms`,
+        }
+    );
 
     return parseStreamEntries(response);
 };
@@ -297,8 +347,24 @@ const acknowledgeMessages = async (messageIds) => {
     }
 
     await ensureQueueReady();
-    await sendRedisCommand(["XACK", redisQueueStream, redisQueueGroup, ...messageIds]);
-    await sendRedisCommand(["XDEL", redisQueueStream, ...messageIds]);
+    const queueClient = await getClient();
+    const pipeline = queueClient.MULTI();
+    const timeoutMs = Math.max(
+        Math.max(100, redisCommandTimeoutMs),
+        Math.min(30_000, Math.max(1, messageIds.length) * 10)
+    );
+
+    pipeline.addCommand(["XACK", redisQueueStream, redisQueueGroup, ...messageIds]);
+    pipeline.addCommand(["XDEL", redisQueueStream, ...messageIds]);
+
+    await withTimeout(
+        pipeline.execAsPipeline(),
+        timeoutMs,
+        `Redis acknowledge pipeline timed out after ${timeoutMs}ms`
+    ).catch((error) => {
+        markRedisUnavailable(error);
+        throw error;
+    });
 };
 
 const parsePendingSummary = (response) => {

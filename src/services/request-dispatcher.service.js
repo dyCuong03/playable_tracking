@@ -3,13 +3,14 @@ const os = require("os");
 const {
     requestQueueBridgePollMs,
     requestQueueBridgeBatchSize,
+    requestQueueBridgeMaxFilesPerRun,
     requestQueueRetryDelayMs,
     bigQueryErrorLogIntervalMs,
 } = require("../config");
 const {
     enqueueEvent,
     rotatePendingFiles,
-    claimReadyFile,
+    claimReadyFiles,
     parseQueueFile,
     completeProcessingFile,
     releaseProcessingFile,
@@ -72,14 +73,19 @@ const getApproximateItemCount = (stats) => {
 
 const runBridgeLoop = async () => {
     while (!stopping) {
-        let claimedFile = null;
+        let claimedFiles = [];
         let processingFile = null;
 
         try {
             await rotatePendingFiles();
 
-            claimedFile = await claimReadyFile(workerName);
-            processingFile = claimedFile ? claimedFile.processingFile : null;
+            claimedFiles = await claimReadyFiles(
+                workerName,
+                Math.max(1, requestQueueBridgeMaxFilesPerRun)
+            );
+            processingFile = claimedFiles.length > 0
+                ? claimedFiles.map((item) => item.processingFile).join(",")
+                : null;
             bridgeState.processingFile = processingFile;
 
             if (!processingFile) {
@@ -87,20 +93,30 @@ const runBridgeLoop = async () => {
                 continue;
             }
 
-            const items = await parseQueueFile(processingFile);
+            const fileBatches = await Promise.all(
+                claimedFiles.map(async (claimedFile) => ({
+                    claimedFile,
+                    items: await parseQueueFile(claimedFile.processingFile),
+                }))
+            );
+            const items = fileBatches.flatMap((entry) => entry.items);
 
             if (items.length > 0) {
                 await flushItemsToRedis(items);
             }
 
-            await completeProcessingFile(processingFile);
+            await Promise.all(
+                fileBatches.map((entry) => completeProcessingFile(entry.claimedFile.processingFile))
+            );
             bridgeState.lastSuccessAt = new Date().toISOString();
         } catch (error) {
-            if (processingFile) {
-                await releaseProcessingFile(
-                    processingFile,
-                    claimedFile && claimedFile.readyFile ? claimedFile.readyFile : null
-                ).catch(() => {});
+            if (claimedFiles.length > 0) {
+                await Promise.all(
+                    claimedFiles.map((claimedFile) => releaseProcessingFile(
+                        claimedFile.processingFile,
+                        claimedFile.readyFile
+                    ).catch(() => {}))
+                );
             }
 
             logBridgeError("Failed to dispatch durable queue to Redis", error, {
