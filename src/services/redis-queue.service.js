@@ -216,6 +216,20 @@ const appendToStream = async (streamName, item) => sendRedisCommand([
     encodeItem(item),
 ]);
 
+const produceToStream = async (streamName, item, options = {}) => executeRedisCommand(
+    [
+        "XADD",
+        streamName,
+        "MAXLEN",
+        "~",
+        Math.max(1000, redisQueueMaxLen),
+        "*",
+        "payload",
+        encodeItem(item),
+    ],
+    options
+);
+
 const appendToStreamBatch = async (streamName, items, options = {}) => {
     if (!items.length) {
         return [];
@@ -259,9 +273,8 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
     });
 };
 
-const enqueueEvent = async (queueItem) => {
-    await ensureQueueReady();
-    return appendToStream(redisQueueStream, queueItem);
+const enqueueEvent = async (queueItem, options = {}) => {
+    return produceToStream(redisQueueStream, queueItem, options);
 };
 
 const enqueueEventBatch = async (items) => {
@@ -269,7 +282,6 @@ const enqueueEventBatch = async (items) => {
         return [];
     }
 
-    await ensureQueueReady();
     return appendToStreamBatch(redisQueueStream, items);
 };
 
@@ -278,7 +290,6 @@ const requeueItems = async (items) => {
         return;
     }
 
-    await ensureQueueReady();
     await appendToStreamBatch(redisQueueStream, items);
 };
 
@@ -413,6 +424,7 @@ const getQueueStats = async () => {
 
 module.exports = {
     ensureQueueReady,
+    produceToStream,
     enqueueEvent,
     enqueueEventBatch,
     requeueItems,
