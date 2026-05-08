@@ -17,7 +17,7 @@ const REJECTED_DIR = path.join(BASE_DIR, "rejected");
 
 let ensurePromise;
 let nextShard = 0;
-const appendChains = new Map();
+const appendStates = new Map();
 
 const ensureQueueDir = async () => {
     if (!ensurePromise) {
@@ -97,52 +97,114 @@ const getNextShard = () => {
     return shard;
 };
 
+const getAppendState = (targetFile) => {
+    if (!appendStates.has(targetFile)) {
+        appendStates.set(targetFile, {
+            entries: [],
+            flushing: false,
+            scheduled: false,
+            waiters: [],
+        });
+    }
+
+    return appendStates.get(targetFile);
+};
+
+const flushPendingAppends = async (targetFile) => {
+    const state = getAppendState(targetFile);
+
+    if (state.flushing) {
+        await new Promise((resolve, reject) => {
+            state.waiters.push({ resolve, reject });
+        });
+        return;
+    }
+
+    if (!state.entries.length) {
+        return;
+    }
+
+    state.flushing = true;
+    state.scheduled = false;
+
+    const entries = state.entries.splice(0, state.entries.length);
+    const payload = entries.map((entry) => entry.payload).join("");
+
+    try {
+        await fs.promises.appendFile(targetFile, payload, "utf8");
+        entries.forEach((entry) => entry.resolve(true));
+    } catch (error) {
+        entries.forEach((entry) => entry.reject(error));
+        throw error;
+    } finally {
+        state.flushing = false;
+
+        const waiters = state.waiters.splice(0, state.waiters.length);
+        waiters.forEach((waiter) => waiter.resolve());
+
+        if (state.entries.length > 0) {
+            await flushPendingAppends(targetFile);
+        }
+    }
+};
+
+const scheduleFlush = (targetFile) => {
+    const state = getAppendState(targetFile);
+
+    if (state.scheduled) {
+        return;
+    }
+
+    state.scheduled = true;
+    setImmediate(() => {
+        flushPendingAppends(targetFile).catch((error) => {
+            const waiters = state.waiters.splice(0, state.waiters.length);
+            waiters.forEach((waiter) => waiter.reject(error));
+        });
+    });
+};
+
 const enqueueEvent = async (queueItem) => {
     await ensureQueueDir();
 
     const shard = getNextShard();
     const targetFile = getPendingFilePath(shard);
     const payload = serializeItem(queueItem);
-    const chain = appendChains.get(targetFile) || Promise.resolve();
+    const state = getAppendState(targetFile);
 
-    const nextChain = chain.catch(() => {}).then(() => fs.promises.appendFile(
-        targetFile,
-        payload,
-        "utf8"
-    ));
-
-    appendChains.set(targetFile, nextChain);
-    await nextChain;
-    return true;
+    return new Promise((resolve, reject) => {
+        state.entries.push({
+            payload,
+            resolve,
+            reject,
+        });
+        scheduleFlush(targetFile);
+    });
 };
 
 const rotatePendingShard = async (shard) => {
     await ensureQueueDir();
 
     const targetFile = getPendingFilePath(shard);
-    const chain = appendChains.get(targetFile) || Promise.resolve();
-    const rotation = chain.catch(() => {}).then(async () => {
-        const stat = await fs.promises.stat(targetFile).catch(() => null);
+    await flushPendingAppends(targetFile);
 
-        if (!stat || stat.size === 0) {
-            return null;
-        }
+    const stat = await fs.promises.stat(targetFile).catch(() => null);
 
-        const fileAgeMs = Math.max(0, Date.now() - Number(stat.mtimeMs || 0));
-        const shouldRotateForSize = stat.size >= Math.max(1, requestQueueRotateMinBytes);
-        const shouldRotateForAge = fileAgeMs >= Math.max(0, requestQueueRotateMaxAgeMs);
+    if (!stat || stat.size === 0) {
+        return null;
+    }
 
-        if (!shouldRotateForSize && !shouldRotateForAge) {
-            return null;
-        }
+    const fileAgeMs = Math.max(0, Date.now() - Number(stat.mtimeMs || 0));
+    const shouldRotateForSize = stat.size >= Math.max(1, requestQueueRotateMinBytes);
+    const shouldRotateForAge = fileAgeMs >= Math.max(0, requestQueueRotateMaxAgeMs);
 
-        const readyFile = getReadyFilePath(getFileSuffix());
-        await fs.promises.rename(targetFile, readyFile);
-        return readyFile;
-    });
+    if (!shouldRotateForSize && !shouldRotateForAge) {
+        return null;
+    }
 
-    appendChains.set(targetFile, rotation.catch(() => {}));
-    return rotation;
+    const readyFile = getReadyFilePath(getFileSuffix());
+    await fs.promises.rename(targetFile, readyFile);
+    return readyFile;
 };
 
 const rotatePendingFiles = async () => {
@@ -234,7 +296,7 @@ const releaseProcessingFile = async (processingFile, readyFile) => {
 };
 
 const resetQueueState = async () => {
-    appendChains.clear();
+    appendStates.clear();
     ensurePromise = null;
     nextShard = 0;
     await fs.promises.rm(BASE_DIR, {
