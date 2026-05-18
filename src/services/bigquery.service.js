@@ -9,6 +9,7 @@ const logService = require("./log.service");
 
 let client;
 const tableRefs = new Map();
+const tableSchemaRefs = new Map();
 
 const TABLE_BY_ENVIRONMENT = {
     production: "pixel_events_production",
@@ -82,8 +83,8 @@ const buildRow = (event) => ({
     playable_id: event.playableId || "",
     session_id: event.sid,
     platform: event.platform || "",
-    campaign_raw: JSON.stringify(event.campaignRaw || {}),
-    event_params: JSON.stringify(event.params || {}),
+    campaign_raw: event.campaignRaw || {},
+    event_params: event.params || {},
     ip: event.ip,
     user_agent: event.ua,
     referer: event.ref,
@@ -102,6 +103,106 @@ const safeParseJSON = (value) => {
         return {};
     }
 };
+
+const isPlainObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isJSONStringCandidate = (value) => {
+    const normalized = String(value || "").trim();
+
+    if (!normalized) {
+        return false;
+    }
+
+    return (
+        normalized.startsWith("{") ||
+        normalized.startsWith("[") ||
+        normalized === "null" ||
+        normalized === "true" ||
+        normalized === "false" ||
+        /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(normalized)
+    );
+};
+
+const parseJSONValue = (value) => {
+    if (typeof value !== "string") {
+        return value;
+    }
+
+    if (!isJSONStringCandidate(value)) {
+        return value;
+    }
+
+    try {
+        return JSON.parse(value);
+    } catch (_) {
+        return value;
+    }
+};
+
+const normalizeValueForBigQueryType = (value, fieldType) => {
+    const normalizedType = String(fieldType || "").toUpperCase();
+
+    if (normalizedType === "JSON") {
+        if (value === undefined) {
+            return {};
+        }
+
+        return parseJSONValue(value);
+    }
+
+    if (normalizedType === "STRING") {
+        if (value === undefined || value === null) {
+            return "";
+        }
+
+        if (typeof value === "string") {
+            return value;
+        }
+
+        if (Array.isArray(value) || isPlainObject(value)) {
+            return JSON.stringify(value);
+        }
+
+        return String(value);
+    }
+
+    return value;
+};
+
+const getTableSchema = async (tableName) => {
+    if (!tableSchemaRefs.has(tableName)) {
+        tableSchemaRefs.set(
+            tableName,
+            getTable(tableName)
+                .getMetadata()
+                .then(([metadata]) => {
+                    const fields = (((metadata || {}).schema || {}).fields || []);
+
+                    return fields.reduce((acc, field) => {
+                        if (field && field.name) {
+                            acc.set(String(field.name).toLowerCase(), String(field.type || "").toUpperCase());
+                        }
+
+                        return acc;
+                    }, new Map());
+                })
+                .catch((error) => {
+                    tableSchemaRefs.delete(tableName);
+                    throw error;
+                })
+        );
+    }
+
+    return tableSchemaRefs.get(tableName);
+};
+
+const formatRowForInsert = (row, fieldTypes = new Map()) => Object.keys(row || {}).reduce((acc, key) => {
+    acc[key] = normalizeValueForBigQueryType(
+        row[key],
+        fieldTypes.get(String(key).toLowerCase())
+    );
+    return acc;
+}, {});
 
 const normalizeLogEntry = (event, row, logEntry) => {
     if (logEntry) {
@@ -154,11 +255,13 @@ const logInsertError = (error, row, logEntry, event, tableName) => {
     );
 };
 
-const insertBatch = (tableName, rows) => {
+const insertBatch = async (tableName, rows) => {
+    const fieldTypes = await getTableSchema(tableName);
+
     return getTable(tableName).insert(
         rows.map((row) => ({
             insertId: row.event_hash,
-            json: row,
+            json: formatRowForInsert(row, fieldTypes),
         })),
         { raw: true }
     );
@@ -189,8 +292,10 @@ module.exports = {
     insertEvent,
     insertBatch,
     buildRow,
+    formatRowForInsert,
     hashEvent,
     isBigQueryConfigured: () => isConfigured,
+    normalizeValueForBigQueryType,
     resolveTableName,
     logInsertError,
 };

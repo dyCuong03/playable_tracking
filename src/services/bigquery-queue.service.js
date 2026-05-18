@@ -110,6 +110,8 @@ const getAppendState = (targetFile) => {
     return appendStates.get(targetFile);
 };
 
+const isMissingPathError = (error) => Boolean(error && error.code === "ENOENT");
+
 const flushPendingAppends = async (targetFile) => {
     const state = getAppendState(targetFile);
 
@@ -203,7 +205,16 @@ const rotatePendingShard = async (shard) => {
     }
 
     const readyFile = getReadyFilePath(getFileSuffix());
-    await fs.promises.rename(targetFile, readyFile);
+    try {
+        await fs.promises.rename(targetFile, readyFile);
+    } catch (error) {
+        if (isMissingPathError(error)) {
+            return null;
+        }
+
+        throw error;
+    }
+
     return readyFile;
 };
 
@@ -240,7 +251,7 @@ const claimReadyFile = async (workerName) => {
                 processingFile,
             };
         } catch (error) {
-            if (error && error.code === "ENOENT") {
+            if (isMissingPathError(error)) {
                 continue;
             }
 
@@ -291,7 +302,16 @@ const releaseProcessingFile = async (processingFile, readyFile) => {
         return null;
     }
 
-    await fs.promises.rename(processingFile, readyFile);
+    try {
+        await fs.promises.rename(processingFile, readyFile);
+    } catch (error) {
+        if (isMissingPathError(error)) {
+            return null;
+        }
+
+        throw error;
+    }
+
     return readyFile;
 };
 
