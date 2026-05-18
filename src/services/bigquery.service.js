@@ -190,10 +190,15 @@ const isValidTimestamp = (value) => {
 const normalizeValueForBigQueryType = (value, fieldType, options = {}) => {
     const {
         jsonMode = "string",
+        skipJSONFields = false,
     } = options;
     const normalizedType = String(fieldType || "").toUpperCase();
 
     if (normalizedType === "JSON") {
+        if (skipJSONFields) {
+            return undefined;
+        }
+
         const normalizedJsonValue = value === undefined || value === null
             ? {}
             : parseJSONValue(value);
@@ -252,11 +257,16 @@ const getTableSchema = async (tableName) => {
 };
 
 const formatRowForInsert = (row, fieldTypes = new Map(), options = {}) => Object.keys(row || {}).reduce((acc, key) => {
-    acc[key] = normalizeValueForBigQueryType(
+    const normalizedValue = normalizeValueForBigQueryType(
         row[key],
         fieldTypes.get(String(key).toLowerCase()),
         options
     );
+
+    if (normalizedValue !== undefined) {
+        acc[key] = normalizedValue;
+    }
+
     return acc;
 }, {});
 
@@ -479,7 +489,14 @@ const logInsertError = (error, row, logEntry, event, tableName) => {
 const insertBatch = async (tableName, rows) => {
     const fieldTypes = await getTableSchema(tableName);
     const table = getTable(tableName);
-    const formattedRows = rows.map((row) => formatRowForInsert(row, fieldTypes, { jsonMode: "native" }));
+    const formattedRows = rows.map((row) => formatRowForInsert(
+        row,
+        fieldTypes,
+        {
+            jsonMode: "native",
+            skipJSONFields: true,
+        }
+    ));
 
     assertValidFormattedRows(tableName, formattedRows, fieldTypes, { jsonMode: "native" });
 
