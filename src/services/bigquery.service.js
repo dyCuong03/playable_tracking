@@ -252,9 +252,15 @@ const getTableSchema = async (tableName) => {
 };
 
 const formatRowForInsert = (row, fieldTypes = new Map(), options = {}) => Object.keys(row || {}).reduce((acc, key) => {
+    const normalizedKey = String(key).toLowerCase();
+
+    if (!fieldTypes.has(normalizedKey)) {
+        return acc;
+    }
+
     acc[key] = normalizeValueForBigQueryType(
         row[key],
-        fieldTypes.get(String(key).toLowerCase()),
+        fieldTypes.get(normalizedKey),
         options
     );
     return acc;
@@ -500,9 +506,9 @@ const logInsertError = (error, row, logEntry, event, tableName) => {
 const insertBatch = async (tableName, rows) => {
     const fieldTypes = await getTableSchema(tableName);
     const table = getTable(tableName);
-    const formattedRows = rows.map((row) => formatRowForInsert(row, fieldTypes, { jsonMode: "native" }));
+    const formattedRows = rows.map((row) => formatRowForInsert(row, fieldTypes, { jsonMode: "string" }));
 
-    assertValidFormattedRows(tableName, formattedRows, fieldTypes, { jsonMode: "native" });
+    assertValidFormattedRows(tableName, formattedRows, fieldTypes, { jsonMode: "string" });
 
     console.error(JSON.stringify({
         level: "info",
@@ -524,7 +530,7 @@ const insertBatch = async (tableName, rows) => {
                     json: row,
                 })),
                 fieldTypes,
-                { jsonMode: "native" }
+                { jsonMode: "string" }
             )
         );
         throw error;

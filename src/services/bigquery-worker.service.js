@@ -322,8 +322,12 @@ const processMessages = async (items) => {
                 tableName: chunk.tableName,
                 count: chunk.items.length,
                 reason: error.message,
+                stack: error && error.stack ? error.stack : null,
+                errorName: error && error.name ? error.name : null,
+                errorCode: error && error.code ? error.code : null,
                 details: getErrorDetails(error),
                 rowErrors: getErrorRowDiagnostics(error),
+                sampleRow: chunk.items[0] && chunk.items[0].row ? chunk.items[0].row : null,
             });
 
             await sleep(Math.max(1000, bigQueryRetryDelayMs));
