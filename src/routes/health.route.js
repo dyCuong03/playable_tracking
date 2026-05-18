@@ -2,6 +2,7 @@
 
 const express = require("express");
 const { getQueueStats } = require("../services/redis-queue.service");
+const { getBigQueryStatus } = require("../services/bigquery.service");
 const { getDispatcherSummary } = require("../services/request-dispatcher.service");
 
 const router = express.Router();
@@ -43,6 +44,7 @@ router.get("/health", async (req, res) => {
 
     res.status(200).json({
         ok: true,
+        bigQuery: getBigQueryStatus(),
         dispatcher,
         queue,
     });

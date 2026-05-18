@@ -9,7 +9,12 @@ if (require.main === module) {
     process.on("SIGTERM", shutdown);
 
     startWorker().catch((error) => {
-        console.error(error.message);
+        console.error(JSON.stringify({
+            level: "error",
+            type: "bigquery-worker-startup",
+            message: "Failed to start BigQuery worker",
+            reason: error.message,
+        }));
         process.exit(1);
     });
 }

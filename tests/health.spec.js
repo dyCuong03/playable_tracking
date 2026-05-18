@@ -21,6 +21,9 @@ test("GET /health skips Redis stats by default", async () => {
         .expect(200);
 
     assert.equal(response.body.ok, true);
+    assert.equal(typeof response.body.bigQuery.enabled, "boolean");
+    assert.equal(typeof response.body.bigQuery.configured, "boolean");
+    assert.ok(Array.isArray(response.body.bigQuery.issues));
     assert.equal(response.body.queue.ok, true);
     assert.equal(response.body.queue.skipped, true);
     assert.equal(response.body.dispatcher.bridge.running, false);

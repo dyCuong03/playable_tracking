@@ -54,13 +54,13 @@ test("formatRowForInsert parses legacy JSON strings for JSON columns", () => {
 
     const formatted = formatRowForInsert(row, fieldTypes);
 
-    assert.deepEqual(formatted.campaign_raw, { network: "meta", campaignId: 123 });
-    assert.deepEqual(formatted.event_params, { level: "1", source: "ad" });
+    assert.equal(formatted.campaign_raw, "{\"network\":\"meta\",\"campaignId\":123}");
+    assert.equal(formatted.event_params, "{\"level\":\"1\",\"source\":\"ad\"}");
 });
 
-test("normalizeValueForBigQueryType leaves plain strings intact for JSON columns", () => {
+test("normalizeValueForBigQueryType encodes plain strings as valid JSON for JSON columns", () => {
     assert.equal(
         normalizeValueForBigQueryType("plain-text", "JSON"),
-        "plain-text"
+        "\"plain-text\""
     );
 });

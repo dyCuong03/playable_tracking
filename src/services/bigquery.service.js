@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const fs = require("fs");
 const { BigQuery } = require("@google-cloud/bigquery");
 const {
     bigQueryDataset,
@@ -20,6 +21,28 @@ const isConfigured = Boolean(
     bigQueryEnabled &&
     bigQueryDataset
 );
+
+const getBigQueryStatus = () => {
+    const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || "";
+    const credentialsPresent = credentialsPath
+        ? fs.existsSync(credentialsPath)
+        : false;
+
+    return {
+        enabled: bigQueryEnabled,
+        dataset: bigQueryDataset || "",
+        defaultTable: bigQueryTable || "",
+        configured: isConfigured,
+        credentialsPath,
+        credentialsPresent,
+        issues: [
+            !bigQueryEnabled ? "BIGQUERY_ENABLED is false" : null,
+            !bigQueryDataset ? "BIGQUERY_DATASET is empty" : null,
+            !credentialsPath ? "GOOGLE_APPLICATION_CREDENTIALS is empty" : null,
+            (credentialsPath && !credentialsPresent) ? "GOOGLE_APPLICATION_CREDENTIALS file not found" : null,
+        ].filter(Boolean),
+    };
+};
 
 const getClient = () => {
     if (!client) {
@@ -143,11 +166,11 @@ const normalizeValueForBigQueryType = (value, fieldType) => {
     const normalizedType = String(fieldType || "").toUpperCase();
 
     if (normalizedType === "JSON") {
-        if (value === undefined) {
-            return {};
+        if (value === undefined || value === null) {
+            return "{}";
         }
 
-        return parseJSONValue(value);
+        return JSON.stringify(parseJSONValue(value));
     }
 
     if (normalizedType === "STRING") {
@@ -293,6 +316,7 @@ module.exports = {
     insertBatch,
     buildRow,
     formatRowForInsert,
+    getBigQueryStatus,
     hashEvent,
     isBigQueryConfigured: () => isConfigured,
     normalizeValueForBigQueryType,
