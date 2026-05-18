@@ -5,6 +5,7 @@ const {
     buildRow,
     formatRowForInsert,
     normalizeValueForBigQueryType,
+    validateFormattedRowForInsert,
 } = require("../src/services/bigquery.service");
 
 test("buildRow keeps structured payloads as objects before insert formatting", () => {
@@ -63,4 +64,52 @@ test("normalizeValueForBigQueryType encodes plain strings as valid JSON for JSON
         normalizeValueForBigQueryType("plain-text", "JSON"),
         "\"plain-text\""
     );
+});
+
+test("normalizeValueForBigQueryType can keep native objects for JSON columns", () => {
+    assert.deepEqual(
+        normalizeValueForBigQueryType({ network: "unknown" }, "JSON", { jsonMode: "native" }),
+        { network: "unknown" }
+    );
+});
+
+test("formatRowForInsert can keep native objects for JSON columns", () => {
+    const row = {
+        campaign_raw: { network: "unknown" },
+        event_params: { reason: "debug" },
+    };
+    const fieldTypes = new Map([
+        ["campaign_raw", "JSON"],
+        ["event_params", "JSON"],
+    ]);
+
+    const formatted = formatRowForInsert(row, fieldTypes, { jsonMode: "native" });
+
+    assert.deepEqual(formatted.campaign_raw, { network: "unknown" });
+    assert.deepEqual(formatted.event_params, { reason: "debug" });
+});
+
+test("validateFormattedRowForInsert reports invalid field types with field names", () => {
+    const row = {
+        event_time: "not-a-timestamp",
+        campaign_raw: "{bad json",
+        event_params: "{\"ok\":true}",
+        package_name: 123,
+    };
+    const fieldTypes = new Map([
+        ["event_time", "TIMESTAMP"],
+        ["campaign_raw", "JSON"],
+        ["event_params", "JSON"],
+        ["package_name", "STRING"],
+    ]);
+
+    const issues = validateFormattedRowForInsert(row, fieldTypes);
+
+    assert.deepEqual(
+        issues.map((item) => item.field),
+        ["event_time", "campaign_raw", "package_name"]
+    );
+    assert.equal(issues[0].type, "TIMESTAMP");
+    assert.equal(issues[1].type, "JSON");
+    assert.equal(issues[2].type, "STRING");
 });

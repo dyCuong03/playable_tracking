@@ -123,6 +123,31 @@ const buildRowErrorMessage = (error, rowError) => {
     return `${error.message} [${reasons.join(",")}]`;
 };
 
+const getErrorDetails = (error) => {
+    if (!error || !error.details) {
+        return null;
+    }
+
+    return error.details;
+};
+
+const getErrorRowDiagnostics = (error) => {
+    if (!Array.isArray(error && error.errors)) {
+        return [];
+    }
+
+    return error.errors.map((rowError) => ({
+        insertId: rowError && rowError.row ? rowError.row.insertId || null : null,
+        errors: Array.isArray(rowError && rowError.errors)
+            ? rowError.errors.map((entry) => ({
+                reason: entry && entry.reason ? entry.reason : null,
+                message: entry && entry.message ? entry.message : null,
+                location: entry && entry.location ? entry.location : null,
+            }))
+            : [],
+    }));
+};
+
 const buildChunks = (items) => {
     const grouped = items.reduce((acc, item) => {
         if (!acc.has(item.tableName)) {
@@ -262,6 +287,8 @@ const processMessages = async (items) => {
                         tableName: chunk.tableName,
                         count: retryItems.length,
                         reason: error.message,
+                        details: getErrorDetails(error),
+                        rowErrors: getErrorRowDiagnostics(error),
                     });
                     await sleep(Math.max(1000, bigQueryRetryDelayMs));
                 }
@@ -271,6 +298,8 @@ const processMessages = async (items) => {
                         tableName: chunk.tableName,
                         count: rejectedItems.length,
                         reason: error.message,
+                        details: getErrorDetails(error),
+                        rowErrors: getErrorRowDiagnostics(error),
                     });
                 }
 
@@ -293,6 +322,8 @@ const processMessages = async (items) => {
                 tableName: chunk.tableName,
                 count: chunk.items.length,
                 reason: error.message,
+                details: getErrorDetails(error),
+                rowErrors: getErrorRowDiagnostics(error),
             });
 
             await sleep(Math.max(1000, bigQueryRetryDelayMs));

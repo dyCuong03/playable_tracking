@@ -162,15 +162,47 @@ const parseJSONValue = (value) => {
     }
 };
 
-const normalizeValueForBigQueryType = (value, fieldType) => {
+const previewValue = (value) => {
+    try {
+        if (typeof value === "string") {
+            return value.length > 200 ? `${value.slice(0, 200)}...` : value;
+        }
+
+        const serialized = JSON.stringify(value);
+        return serialized.length > 200 ? `${serialized.slice(0, 200)}...` : serialized;
+    } catch (_) {
+        return String(value);
+    }
+};
+
+const isValidTimestamp = (value) => {
+    if (value instanceof Date) {
+        return Number.isFinite(value.getTime());
+    }
+
+    if (typeof value !== "string" || !value.trim()) {
+        return false;
+    }
+
+    return Number.isFinite(Date.parse(value));
+};
+
+const normalizeValueForBigQueryType = (value, fieldType, options = {}) => {
+    const {
+        jsonMode = "string",
+    } = options;
     const normalizedType = String(fieldType || "").toUpperCase();
 
     if (normalizedType === "JSON") {
-        if (value === undefined || value === null) {
-            return "{}";
+        const normalizedJsonValue = value === undefined || value === null
+            ? {}
+            : parseJSONValue(value);
+
+        if (jsonMode === "native") {
+            return normalizedJsonValue;
         }
 
-        return JSON.stringify(parseJSONValue(value));
+        return JSON.stringify(normalizedJsonValue);
     }
 
     if (normalizedType === "STRING") {
@@ -219,13 +251,111 @@ const getTableSchema = async (tableName) => {
     return tableSchemaRefs.get(tableName);
 };
 
-const formatRowForInsert = (row, fieldTypes = new Map()) => Object.keys(row || {}).reduce((acc, key) => {
+const formatRowForInsert = (row, fieldTypes = new Map(), options = {}) => Object.keys(row || {}).reduce((acc, key) => {
     acc[key] = normalizeValueForBigQueryType(
         row[key],
-        fieldTypes.get(String(key).toLowerCase())
+        fieldTypes.get(String(key).toLowerCase()),
+        options
     );
     return acc;
 }, {});
+
+const buildInsertRows = (rows, fieldTypes, options = {}) => rows.map((row) => ({
+    insertId: row.event_hash,
+    json: formatRowForInsert(row, fieldTypes, options),
+}));
+
+const validateValueForBigQueryType = (value, fieldType) => {
+    const normalizedType = String(fieldType || "").toUpperCase();
+
+    if (!normalizedType) {
+        return null;
+    }
+
+    if (normalizedType === "TIMESTAMP" && !isValidTimestamp(value)) {
+        return "Expected ISO timestamp string";
+    }
+
+    if (normalizedType === "JSON") {
+        if (typeof value !== "string") {
+            return "Expected JSON-encoded string payload";
+        }
+
+        try {
+            JSON.parse(value);
+        } catch (_) {
+            return "Expected valid JSON text";
+        }
+    }
+
+    if (normalizedType === "STRING" && typeof value !== "string") {
+        return "Expected string value";
+    }
+
+    return null;
+};
+
+const validateFormattedRowForInsert = (row, fieldTypes = new Map()) => Object.keys(row || {}).reduce((acc, key) => {
+    const fieldType = fieldTypes.get(String(key).toLowerCase());
+    const issue = validateValueForBigQueryType(row[key], fieldType);
+
+    if (issue) {
+        acc.push({
+            field: key,
+            type: fieldType || "UNKNOWN",
+            issue,
+            valuePreview: previewValue(row[key]),
+        });
+    }
+
+    return acc;
+}, []);
+
+const createValidationError = (tableName, invalidRows) => {
+    const error = new Error("BigQuery row validation failed before insert");
+    error.code = "BIGQUERY_ROW_VALIDATION";
+    error.details = {
+        tableName,
+        invalidRows,
+    };
+    return error;
+};
+
+const assertValidInsertRows = (tableName, insertRows, fieldTypes) => {
+    const invalidRows = insertRows.reduce((acc, entry) => {
+        const issues = validateFormattedRowForInsert(entry.json, fieldTypes);
+
+        if (issues.length > 0) {
+            acc.push({
+                insertId: entry.insertId || null,
+                issues,
+            });
+        }
+
+        return acc;
+    }, []);
+
+    if (invalidRows.length > 0) {
+        throw createValidationError(tableName, invalidRows);
+    }
+};
+
+const buildRowErrorDetails = (error) => {
+    if (!Array.isArray(error && error.errors)) {
+        return [];
+    }
+
+    return error.errors.map((rowError) => ({
+        insertId: rowError && rowError.row ? rowError.row.insertId || null : null,
+        reasons: Array.isArray(rowError && rowError.errors)
+            ? rowError.errors.map((entry) => ({
+                reason: entry && entry.reason ? entry.reason : null,
+                message: entry && entry.message ? entry.message : null,
+                location: entry && entry.location ? entry.location : null,
+            }))
+            : [],
+    }));
+};
 
 const normalizeLogEntry = (event, row, logEntry) => {
     if (logEntry) {
@@ -253,6 +383,8 @@ const normalizeLogEntry = (event, row, logEntry) => {
 
 const logInsertError = (error, row, logEntry, event, tableName) => {
     const entry = normalizeLogEntry(event, row, logEntry);
+    const details = error && error.details ? error.details : null;
+    const rowErrors = buildRowErrorDetails(error);
 
     logService.write(
         {
@@ -262,6 +394,8 @@ const logInsertError = (error, row, logEntry, event, tableName) => {
             bigquery_error: {
                 message: error.message,
                 code: error.code || null,
+                details,
+                rowErrors,
             },
         },
         true
@@ -274,20 +408,38 @@ const logInsertError = (error, row, logEntry, event, tableName) => {
             message: error.message,
             tableName,
             eventHash: (row && row.event_hash) || null,
+            details,
+            rowErrors,
         })
     );
 };
 
+const isJSONParseInsertError = (error) => String(error && error.message ? error.message : "")
+    .includes("Unexpected non-whitespace character after JSON");
+
 const insertBatch = async (tableName, rows) => {
     const fieldTypes = await getTableSchema(tableName);
+    const table = getTable(tableName);
+    const stringModeRows = buildInsertRows(rows, fieldTypes, { jsonMode: "string" });
 
-    return getTable(tableName).insert(
-        rows.map((row) => ({
-            insertId: row.event_hash,
-            json: formatRowForInsert(row, fieldTypes),
-        })),
+    assertValidInsertRows(tableName, stringModeRows, fieldTypes);
+
+    return table.insert(
+        stringModeRows,
         { raw: true }
-    );
+    ).catch((error) => {
+        if (!isJSONParseInsertError(error)) {
+            throw error;
+        }
+
+        const nativeModeRows = buildInsertRows(rows, fieldTypes, { jsonMode: "native" });
+        assertValidInsertRows(tableName, nativeModeRows, fieldTypes);
+
+        return table.insert(
+            nativeModeRows,
+            { raw: true }
+        );
+    });
 };
 
 const insertEvent = (event, row, logEntry) => {
@@ -322,4 +474,5 @@ module.exports = {
     normalizeValueForBigQueryType,
     resolveTableName,
     logInsertError,
+    validateFormattedRowForInsert,
 };
