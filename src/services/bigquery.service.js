@@ -352,6 +352,27 @@ const buildInsertDiagnostics = (tableName, insertRows, fieldTypes, options = {})
     })),
 });
 
+const getValueType = (value) => {
+    if (value === null) {
+        return "null";
+    }
+
+    if (Array.isArray(value)) {
+        return "array";
+    }
+
+    if (value instanceof Date) {
+        return "date";
+    }
+
+    return typeof value;
+};
+
+const buildSampleTypes = (row) => Object.keys(row || {}).reduce((acc, key) => {
+    acc[key] = getValueType(row[key]);
+    return acc;
+}, {});
+
 const attachErrorDetails = (error, details) => {
     if (!error || !details) {
         return error;
@@ -490,6 +511,7 @@ const insertBatch = async (tableName, rows) => {
         tableName,
         fieldTypes: Object.fromEntries(fieldTypes.entries()),
         sample: formattedRows[0] || null,
+        sampleTypes: buildSampleTypes(formattedRows[0] || {}),
     }));
 
     return table.insert(formattedRows).catch((error) => {
