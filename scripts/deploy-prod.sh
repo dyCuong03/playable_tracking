@@ -13,6 +13,7 @@ REDIS_APP_NAME="pixel-redis"
 NGINX_APP_NAME="pixel-nginx"
 NETWORK_NAME="pixel-server-net"
 IMAGE_NAME="pixel-server:latest"
+BUILD_NO_CACHE="${BUILD_NO_CACHE:-1}"
 HOST_PORT=9000
 CONTAINER_PORT=9000
 WORKER_COUNT="${WORKER_COUNT:-4}"
@@ -67,6 +68,28 @@ command -v docker >/dev/null 2>&1 || {
   exit 1
 }
 
+remove_container_if_exists() {
+  local container_name="$1"
+  if docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+    docker rm -f "$container_name"
+  fi
+}
+
+remove_containers_by_prefix() {
+  local prefix="$1"
+  local names
+  names="$(docker ps -a --format '{{.Names}}' | grep "^${prefix}-" || true)"
+
+  if [[ -z "$names" ]]; then
+    return
+  fi
+
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    docker rm -f "$name"
+  done <<< "$names"
+}
+
 # =========================
 # DETECT PUBLIC IP
 # =========================
@@ -81,43 +104,21 @@ SERVER_IP=$(
 # BUILD IMAGE
 # =========================
 echo "Building Docker image..."
-docker build -t "$IMAGE_NAME" .
+BUILD_ARGS=(-t "$IMAGE_NAME" .)
+if [[ "$BUILD_NO_CACHE" == "1" || "$BUILD_NO_CACHE" == "true" || "$BUILD_NO_CACHE" == "yes" ]]; then
+  BUILD_ARGS=(--no-cache "${BUILD_ARGS[@]}")
+fi
+docker build "${BUILD_ARGS[@]}"
 
 # =========================
 # STOP OLD CONTAINERS
 # =========================
-if docker ps -a --format '{{.Names}}' | grep -q "^${REDIS_APP_NAME}$"; then
-  docker rm -f "$REDIS_APP_NAME"
-fi
-
-if docker ps -a --format '{{.Names}}' | grep -q "^${NGINX_APP_NAME}$"; then
-  docker rm -f "$NGINX_APP_NAME"
-fi
-
-if docker ps -a --format '{{.Names}}' | grep -q "^${LEGACY_SERVER_APP_NAME}$"; then
-  docker rm -f "$LEGACY_SERVER_APP_NAME"
-fi
-
-for i in $(seq 1 "$APP_REPLICAS"); do
-  SERVER_APP_NAME="${SERVER_APP_PREFIX}-${i}"
-  if docker ps -a --format '{{.Names}}' | grep -q "^${SERVER_APP_NAME}$"; then
-    docker rm -f "$SERVER_APP_NAME"
-  fi
-done
-
-for i in $(seq 1 "$WORKER_COUNT"); do
-  WORKER_NAME="${WORKER_APP_NAME_PREFIX}-${i}"
-  if docker ps -a --format '{{.Names}}' | grep -q "^${WORKER_NAME}$"; then
-    docker rm -f "$WORKER_NAME"
-  fi
-done
-
-for i in $(seq 1 "$DISPATCHER_COUNT"); do
-  DISPATCHER_NAME="${DISPATCHER_APP_NAME_PREFIX}-${i}"
-  if docker ps -a --format '{{.Names}}' | grep -q "^${DISPATCHER_NAME}$"; then
-    docker rm -f "$DISPATCHER_NAME"
-  fi
-done
+remove_container_if_exists "$REDIS_APP_NAME"
+remove_container_if_exists "$NGINX_APP_NAME"
+remove_container_if_exists "$LEGACY_SERVER_APP_NAME"
+remove_containers_by_prefix "$SERVER_APP_PREFIX"
+remove_containers_by_prefix "$WORKER_APP_NAME_PREFIX"
+remove_containers_by_prefix "$DISPATCHER_APP_NAME_PREFIX"
 
 if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
   docker network create "$NETWORK_NAME"
