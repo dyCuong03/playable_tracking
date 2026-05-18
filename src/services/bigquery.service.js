@@ -265,7 +265,10 @@ const buildInsertRows = (rows, fieldTypes, options = {}) => rows.map((row) => ({
     json: formatRowForInsert(row, fieldTypes, options),
 }));
 
-const validateValueForBigQueryType = (value, fieldType) => {
+const validateValueForBigQueryType = (value, fieldType, options = {}) => {
+    const {
+        jsonMode = "string",
+    } = options;
     const normalizedType = String(fieldType || "").toUpperCase();
 
     if (!normalizedType) {
@@ -277,11 +280,24 @@ const validateValueForBigQueryType = (value, fieldType) => {
     }
 
     if (normalizedType === "JSON") {
-        if (typeof value !== "string") {
-            return "Expected JSON-encoded string payload";
+        if (jsonMode === "native") {
+            if (value === undefined) {
+                return "Expected JSON-compatible value";
+            }
+
+            try {
+                JSON.stringify(value);
+                return null;
+            } catch (_) {
+                return "Expected JSON-compatible value";
+            }
         }
 
         try {
+            if (typeof value !== "string") {
+                return "Expected JSON-encoded string payload";
+            }
+
             JSON.parse(value);
         } catch (_) {
             return "Expected valid JSON text";
@@ -295,9 +311,9 @@ const validateValueForBigQueryType = (value, fieldType) => {
     return null;
 };
 
-const validateFormattedRowForInsert = (row, fieldTypes = new Map()) => Object.keys(row || {}).reduce((acc, key) => {
+const validateFormattedRowForInsert = (row, fieldTypes = new Map(), options = {}) => Object.keys(row || {}).reduce((acc, key) => {
     const fieldType = fieldTypes.get(String(key).toLowerCase());
-    const issue = validateValueForBigQueryType(row[key], fieldType);
+    const issue = validateValueForBigQueryType(row[key], fieldType, options);
 
     if (issue) {
         acc.push({
@@ -321,6 +337,34 @@ const createValidationError = (tableName, invalidRows) => {
     return error;
 };
 
+const summarizeFieldTypes = (fieldTypes = new Map()) => Array.from(fieldTypes.entries()).reduce((acc, [key, value]) => {
+    acc[key] = value;
+    return acc;
+}, {});
+
+const buildInsertDiagnostics = (tableName, insertRows, fieldTypes, options = {}) => ({
+    tableName,
+    jsonMode: options.jsonMode || "string",
+    fieldTypes: summarizeFieldTypes(fieldTypes),
+    sample: insertRows.slice(0, 1).map((entry) => ({
+        insertId: entry.insertId || null,
+        json: entry.json,
+    })),
+});
+
+const attachErrorDetails = (error, details) => {
+    if (!error || !details) {
+        return error;
+    }
+
+    error.details = {
+        ...(error.details || {}),
+        ...details,
+    };
+
+    return error;
+};
+
 const assertValidInsertRows = (tableName, insertRows, fieldTypes) => {
     const invalidRows = insertRows.reduce((acc, entry) => {
         const issues = validateFormattedRowForInsert(entry.json, fieldTypes);
@@ -328,6 +372,24 @@ const assertValidInsertRows = (tableName, insertRows, fieldTypes) => {
         if (issues.length > 0) {
             acc.push({
                 insertId: entry.insertId || null,
+                issues,
+            });
+        }
+
+        return acc;
+    }, []);
+
+    if (invalidRows.length > 0) {
+        throw createValidationError(tableName, invalidRows);
+    }
+};
+
+const assertValidFormattedRows = (tableName, rows, fieldTypes, options = {}) => {
+    const invalidRows = rows.reduce((acc, row) => {
+        const issues = validateFormattedRowForInsert(row, fieldTypes, options);
+
+        if (issues.length > 0) {
+            acc.push({
                 issues,
             });
         }
@@ -414,31 +476,27 @@ const logInsertError = (error, row, logEntry, event, tableName) => {
     );
 };
 
-const isJSONParseInsertError = (error) => String(error && error.message ? error.message : "")
-    .includes("Unexpected non-whitespace character after JSON");
-
 const insertBatch = async (tableName, rows) => {
     const fieldTypes = await getTableSchema(tableName);
     const table = getTable(tableName);
-    const stringModeRows = buildInsertRows(rows, fieldTypes, { jsonMode: "string" });
+    const formattedRows = rows.map((row) => formatRowForInsert(row, fieldTypes, { jsonMode: "native" }));
 
-    assertValidInsertRows(tableName, stringModeRows, fieldTypes);
+    assertValidFormattedRows(tableName, formattedRows, fieldTypes, { jsonMode: "native" });
 
-    return table.insert(
-        stringModeRows,
-        { raw: true }
-    ).catch((error) => {
-        if (!isJSONParseInsertError(error)) {
-            throw error;
-        }
-
-        const nativeModeRows = buildInsertRows(rows, fieldTypes, { jsonMode: "native" });
-        assertValidInsertRows(tableName, nativeModeRows, fieldTypes);
-
-        return table.insert(
-            nativeModeRows,
-            { raw: true }
+    return table.insert(formattedRows).catch((error) => {
+        attachErrorDetails(
+            error,
+            buildInsertDiagnostics(
+                tableName,
+                formattedRows.map((row, index) => ({
+                    insertId: rows[index] && rows[index].event_hash ? rows[index].event_hash : null,
+                    json: row,
+                })),
+                fieldTypes,
+                { jsonMode: "native" }
+            )
         );
+        throw error;
     });
 };
 
