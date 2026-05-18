@@ -483,6 +483,15 @@ const insertBatch = async (tableName, rows) => {
 
     assertValidFormattedRows(tableName, formattedRows, fieldTypes, { jsonMode: "native" });
 
+    console.error(JSON.stringify({
+        level: "info",
+        type: "bigquery-debug",
+        message: "Prepared BigQuery insert payload",
+        tableName,
+        fieldTypes: Object.fromEntries(fieldTypes.entries()),
+        sample: formattedRows[0] || null,
+    }));
+
     return table.insert(formattedRows).catch((error) => {
         attachErrorDetails(
             error,
