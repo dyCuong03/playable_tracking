@@ -15,43 +15,35 @@ Follow these steps to make sure every `/p.gif` event is pushed to BigQuery while
    ```sql
    CREATE TABLE `playable_tracking.pixel_events_ver_2`
    (
-     event_time TIMESTAMP,
-     event_name STRING,
-     package_name STRING,
-     playable_id STRING,
-     session_id STRING,
-     platform STRING,
-     campaign_raw STRING,
+     session_id   STRING    NOT NULL,
+     event_name   STRING    NOT NULL,
+     event_time   TIMESTAMP NOT NULL,
+     received_at  TIMESTAMP NOT NULL,
      event_params STRING,
-     ip STRING,
-     user_agent STRING,
-     referer STRING,
-     received_at TIMESTAMP,
-     event_hash STRING
+     event_hash   STRING
    )
    PARTITION BY DATE(received_at);
 
    CREATE TABLE `playable_tracking.pixel_events_production`
    (
-     event_time TIMESTAMP,
-     event_name STRING,
-     package_name STRING,
-     playable_id STRING,
-     session_id STRING,
-     platform STRING,
-     campaign_raw STRING,
+     session_id   STRING    NOT NULL,
+     event_name   STRING    NOT NULL,
+     event_time   TIMESTAMP NOT NULL,
+     received_at  TIMESTAMP NOT NULL,
      event_params STRING,
-     ip STRING,
-     user_agent STRING,
-     referer STRING,
-     received_at TIMESTAMP,
-     event_hash STRING
+     event_hash   STRING
    )
    PARTITION BY DATE(received_at);
    ```
 
    Partitioning on `received_at` keeps storage queries efficient as traffic grows.
-   `event_params` and `campaign_raw` are stored as JSON strings so you can preserve the original structured payloads sent to `/p.gif`.
+   `event_params` is stored as a JSON string. `event_time` is the client-reported timestamp;
+   `received_at` is the server arrival time stamped automatically — never trust `event_time` alone for ordering.
+
+   **Existing deployments (zero migration):** If your tables were created with the old schema, they contain
+   seven additional legacy columns (`platform`, `campaign_raw`, `package_name`, `playable_id`, `ip`,
+   `user_agent`, `referer`). The server no longer writes those columns — new rows will have `NULL` in them.
+   No `ALTER TABLE` is required to keep the server running. See §6 for optional cleanup DDL to drop them.
 
 3. Provision a service account with permission to insert rows through the Cloud Console:
    1. Go to https://console.cloud.google.com/iam-admin/serviceaccounts.
@@ -70,9 +62,9 @@ export BIGQUERY_DATASET=playable_tracking
 ```
 
 `BIGQUERY_ENABLED` gates the insert logic; if it is `false` (default) the server will skip BigQuery writes while still logging to `logs/pixel-tracking.txt`.
-The `/p.gif` query decides the table:
-- `env=production` -> `playable_tracking.pixel_events_production`
-- `env=test` (or missing/unknown value) -> `playable_tracking.pixel_events_ver_2`
+The `env` query param decides the destination table:
+- `env=production` → `playable_tracking.pixel_events_production`
+- `env=test` (or missing/unknown value) → `playable_tracking.pixel_events_ver_2`
 
 ## 3. Deploy
 
@@ -80,23 +72,118 @@ The `/p.gif` query decides the table:
 2. The script verifies `@google-cloud/bigquery` is installed, checks the env vars when `BIGQUERY_ENABLED=true`, and injects them into the container with `-e BIGQUERY_*`.
 3. When the script finishes it prints the health and pixel URLs. Hit them to confirm the service is live.
 
-## 4. Verify ingestion
+## 4. Client API
 
-1. Send a sample pixel request, e.g.
-   ```
-   curl "http://<SERVER_IP>:9000/p.gif?e=test&env=test&pid=my-project&playableId=demo1&sid=abc&platform=ios&camp=%7B%22network%22%3A%22example%22%2C%22campaignId%22%3A123%7D&ts=1736179200000&campaign=summer"
-   curl "http://<SERVER_IP>:9000/p.gif?e=test&env=production&pid=my-project&playableId=demo1&sid=abc&platform=ios&camp=%7B%22network%22%3A%22example%22%2C%22campaignId%22%3A123%7D&ts=1736179200000&campaign=summer"
-   ```
-   `camp` (or `campaign_raw`) must contain a JSON string (URL-encoded) so the server can persist the structured object in the `campaign_raw` column.
-2. Tail `logs/pixel-tracking.txt`; you should see a JSON entry containing all fields plus `delay_time`.
-3. Query the BigQuery table:
-   ```sql
-   SELECT event_name, package_name, platform, campaign_raw, event_params
-   FROM `playable_tracking.pixel_events_ver_2`
-   WHERE event_name = 'test'
-   ORDER BY received_at DESC
-   LIMIT 10;
-   ```
-4. Confirm the row shows up; `event_hash` lets you dedupe if needed.
+Every event is a `GET /p.gif` request with these query parameters:
+
+| Param | Required | Description |
+|---|---|---|
+| `e` | yes | Event name: `start`, `interaction`, `store_trigger`, or `end` |
+| `sid` | yes | Session ID — a stable UUID for the playable session |
+| `event_time` | yes | Client-side event time as an ISO 8601 string (e.g. `2026-06-04T07:00:00.000Z`) |
+| `event_params` | yes | URL-encoded JSON object; shape depends on event type (see below) |
+| `env` | no | `production` routes to the production table; anything else uses the test table |
+
+`received_at` is **always server-generated** — clients must not send it.
+
+### Per-event `event_params` shapes
+
+**`start`** — sent once when the playable loads:
+```json
+{
+  "platform": "android",
+  "campaign": {
+    "network": "meta",
+    "campaign_id": "camp_001",
+    "campaign_name": "summer_2026",
+    "adgroup_id": "ag_1",
+    "creative_id": "creative_3",
+    "click_id": "click_abc",
+    "country": "VN"
+  }
+}
+```
+
+**`interaction`** — sent on each meaningful user interaction:
+```json
+{ "name": "tap" }
+```
+
+**`store_trigger`** — sent when the user taps the install / store CTA:
+```json
+{ "name": "tap_cta" }
+```
+
+**`end`** — sent when the playable session ends (user exits, ad closes, timeout):
+```json
+{ "interact_count": 4 }
+```
+
+## 5. Verify ingestion
+
+Send one sample request per event type (test table):
+
+```bash
+SERVER="http://<SERVER_IP>:9000"
+SID="test-session-$(date +%s)"
+
+# start
+curl "$SERVER/p.gif?e=start&sid=$SID&event_time=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)&env=test&event_params=%7B%22platform%22%3A%22ios%22%2C%22campaign%22%3A%7B%22network%22%3A%22meta%22%2C%22campaign_id%22%3A%22c1%22%7D%7D"
+
+# interaction
+curl "$SERVER/p.gif?e=interaction&sid=$SID&event_time=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)&env=test&event_params=%7B%22name%22%3A%22tap%22%7D"
+
+# store_trigger
+curl "$SERVER/p.gif?e=store_trigger&sid=$SID&event_time=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)&env=test&event_params=%7B%22name%22%3A%22tap_cta%22%7D"
+
+# end
+curl "$SERVER/p.gif?e=end&sid=$SID&event_time=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)&env=test&event_params=%7B%22interact_count%22%3A1%7D"
+```
+
+Tail `logs/pixel-tracking.txt`; you should see a JSON entry for each request.
+
+Query BigQuery to confirm ingestion:
+
+```sql
+SELECT event_name, session_id, event_time, received_at,
+       JSON_VALUE(event_params, '$.platform') AS platform
+FROM `playable_tracking.pixel_events_ver_2`
+WHERE session_id = 'test-session-<YOUR_SID>'
+ORDER BY event_time ASC;
+```
+
+`event_hash` lets you dedupe retried inserts if needed.
+
+## 6. Optional cleanup DDL
+
+The server no longer writes the seven legacy columns (`platform`, `campaign_raw`, `package_name`,
+`playable_id`, `ip`, `user_agent`, `referer`). They remain in existing tables with `NULL` on all new rows.
+The server works correctly whether or not these columns are present — this cleanup is purely cosmetic.
+
+**Before running:** BigQuery requires a column to have no streaming-buffer or time-travel data before it
+can be dropped. Wait at least 7 days after the last write to any of these columns (i.e., after fully
+replacing the old server version) and back up any historical values you want to keep.
+
+```sql
+-- pixel_events_ver_2: drop legacy columns (optional)
+ALTER TABLE `playable_tracking.pixel_events_ver_2`
+  DROP COLUMN IF EXISTS platform,
+  DROP COLUMN IF EXISTS campaign_raw,
+  DROP COLUMN IF EXISTS package_name,
+  DROP COLUMN IF EXISTS playable_id,
+  DROP COLUMN IF EXISTS ip,
+  DROP COLUMN IF EXISTS user_agent,
+  DROP COLUMN IF EXISTS referer;
+
+-- pixel_events_production: same cleanup (optional)
+ALTER TABLE `playable_tracking.pixel_events_production`
+  DROP COLUMN IF EXISTS platform,
+  DROP COLUMN IF EXISTS campaign_raw,
+  DROP COLUMN IF EXISTS package_name,
+  DROP COLUMN IF EXISTS playable_id,
+  DROP COLUMN IF EXISTS ip,
+  DROP COLUMN IF EXISTS user_agent,
+  DROP COLUMN IF EXISTS referer;
+```
 
 With these steps complete every incoming event will be persisted both in the log file and in BigQuery.

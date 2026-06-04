@@ -5,15 +5,15 @@ const crypto = require("crypto");
 const DEFAULTS = {
     baseUrl: "http://127.0.0.1:8080/p.gif",
     sessions: 10,
-    snapshots: 5,
+    interactions: 3,
     intervalMs: 500,
     concurrency: 5,
     env: "test",
-    playableId: "PA0006",
-    packageName: "com.archer.cat.kitchen",
     platform: "web",
     includeHealth: true,
 };
+
+const INTERACTION_NAMES = ["tap", "swipe", "tap", "drag", "tap"];
 
 const parseNumber = (value, fallback) => {
     const parsed = Number(value);
@@ -54,13 +54,14 @@ const parseArgs = () => {
 
         switch (key) {
         case "url":
+        case "baseUrl":
             config.baseUrl = nextValue || config.baseUrl;
             break;
         case "sessions":
             config.sessions = Math.max(1, parseNumber(nextValue, config.sessions));
             break;
-        case "snapshots":
-            config.snapshots = Math.max(1, parseNumber(nextValue, config.snapshots));
+        case "interactions":
+            config.interactions = Math.max(0, parseNumber(nextValue, config.interactions));
             break;
         case "interval-ms":
             config.intervalMs = Math.max(0, parseNumber(nextValue, config.intervalMs));
@@ -70,12 +71,6 @@ const parseArgs = () => {
             break;
         case "env":
             config.env = nextValue || config.env;
-            break;
-        case "playable-id":
-            config.playableId = nextValue || config.playableId;
-            break;
-        case "package-name":
-            config.packageName = nextValue || config.packageName;
             break;
         case "platform":
             config.platform = nextValue || config.platform;
@@ -99,6 +94,10 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const sanitizeBaseUrl = (value) => String(value || "").replace(/\/+$/, "");
 
+const nowIso = () => new Date().toISOString();
+
+const createSessionId = () => `test-${crypto.randomUUID()}`;
+
 const buildCampaignPayload = (sessionIndex) => ({
     network: "test_network",
     campaign_id: `camp_${Math.ceil((sessionIndex + 1) / 10)}`,
@@ -107,42 +106,48 @@ const buildCampaignPayload = (sessionIndex) => ({
     creative_id: `creative_${(sessionIndex % 3) + 1}`,
     click_id: `click_${sessionIndex + 1}`,
     country: "VN",
-    language: "vi",
 });
 
-const createSessionId = (sessionIndex) => `test-${sessionIndex + 1}-${crypto.randomUUID()}`;
+const buildStartParams = (config, sessionId, sessionIndex) => new URLSearchParams({
+    e: "start",
+    sid: sessionId,
+    event_time: nowIso(),
+    event_params: JSON.stringify({
+        platform: config.platform,
+        campaign: buildCampaignPayload(sessionIndex),
+    }),
+    env: config.env,
+});
 
-const buildSnapshotParams = (config, sessionId, sessionIndex, snapshotIndex, sessionStartMs) => {
-    const now = Date.now();
-    const elapsedSec = Math.max(0, Math.floor((now - sessionStartMs) / 1000));
-    const hitCount = snapshotIndex + 1;
-    const quadrantValue = Number((100 / 4).toFixed(2));
+const buildInteractionParams = (config, sessionId, interactionIndex) => new URLSearchParams({
+    e: "interaction",
+    sid: sessionId,
+    event_time: nowIso(),
+    event_params: JSON.stringify({
+        name: INTERACTION_NAMES[interactionIndex % INTERACTION_NAMES.length],
+    }),
+    env: config.env,
+});
 
-    return new URLSearchParams({
-        e: "tracking_snapshot",
-        pid: config.packageName,
-        playable_id: config.playableId,
-        sid: sessionId,
-        ref: "https://playable-load-test.local",
-        ts: String(now),
-        r: Math.random().toString(),
-        plf: config.platform,
-        env: config.env,
-        reason: snapshotIndex === 0 ? "onLoad" : "interval",
-        duration_sec: String(elapsedSec),
-        play_duration_sec: String(elapsedSec),
-        input_count: String(hitCount),
-        input_per_second: String(hitCount),
-        first_input_captured: "1",
-        first_input_time_sec: "0",
-        total_hits: String(hitCount),
-        top_left_pct: String(quadrantValue),
-        top_right_pct: String(quadrantValue),
-        bottom_left_pct: String(quadrantValue),
-        bottom_right_pct: String(quadrantValue),
-        camp: JSON.stringify(buildCampaignPayload(sessionIndex)),
-    });
-};
+const buildStoreTriggerParams = (config, sessionId) => new URLSearchParams({
+    e: "store_trigger",
+    sid: sessionId,
+    event_time: nowIso(),
+    event_params: JSON.stringify({
+        name: "tap_cta",
+    }),
+    env: config.env,
+});
+
+const buildEndParams = (config, sessionId, interactCount) => new URLSearchParams({
+    e: "end",
+    sid: sessionId,
+    event_time: nowIso(),
+    event_params: JSON.stringify({
+        interact_count: interactCount,
+    }),
+    env: config.env,
+});
 
 const sendPixel = async (config, params) => {
     const response = await fetch(`${sanitizeBaseUrl(config.baseUrl)}?${params.toString()}`, {
@@ -156,28 +161,49 @@ const sendPixel = async (config, params) => {
 };
 
 const runSession = async (config, sessionIndex) => {
-    const sessionId = createSessionId(sessionIndex);
-    const sessionStartMs = Date.now();
+    const sessionId = createSessionId();
+    let requestsSent = 0;
 
-    for (let snapshotIndex = 0; snapshotIndex < config.snapshots; snapshotIndex += 1) {
-        const params = buildSnapshotParams(
-            config,
-            sessionId,
-            sessionIndex,
-            snapshotIndex,
-            sessionStartMs
-        );
+    // start
+    await sendPixel(config, buildStartParams(config, sessionId, sessionIndex));
+    requestsSent += 1;
 
-        await sendPixel(config, params);
+    if (config.intervalMs > 0) {
+        await sleep(config.intervalMs);
+    }
 
-        if (snapshotIndex < config.snapshots - 1 && config.intervalMs > 0) {
+    // interactions
+    for (let index = 0; index < config.interactions; index += 1) {
+        await sendPixel(config, buildInteractionParams(config, sessionId, index));
+        requestsSent += 1;
+
+        if (index < config.interactions - 1 && config.intervalMs > 0) {
             await sleep(config.intervalMs);
         }
     }
 
+    // store_trigger: ~30% of sessions trigger the CTA
+    const triggersStore = (sessionIndex % 10) < 3;
+    if (triggersStore) {
+        if (config.intervalMs > 0) {
+            await sleep(config.intervalMs);
+        }
+
+        await sendPixel(config, buildStoreTriggerParams(config, sessionId));
+        requestsSent += 1;
+    }
+
+    // end
+    if (config.intervalMs > 0) {
+        await sleep(config.intervalMs);
+    }
+
+    await sendPixel(config, buildEndParams(config, sessionId, config.interactions));
+    requestsSent += 1;
+
     return {
         sessionId,
-        requestsSent: config.snapshots,
+        requestsSent,
     };
 };
 

@@ -1,0 +1,102 @@
+# .github/workflows/deploy.yml
+#
+# CI/CD: run tests then deploy to VPS on push to main.
+# Deploy style: SSH → git fetch + reset --hard origin/main → ./scripts/deploy-prod.sh (plain docker run,
+# image built locally on VPS — no registry involved).
+#
+# ── Required GitHub Secrets (Settings → Secrets and variables → Actions) ──────
+#
+#   VPS_HOST      VPS IP address or hostname
+#   VPS_USER      SSH login user (e.g. ubuntu, root)
+#   VPS_SSH_KEY   Private SSH key (PEM or OpenSSH format);
+#                 add the matching public key to ~/.ssh/authorized_keys on the VPS
+#   VPS_PORT      SSH port (set to 22 or leave empty to default to 22)
+#   VPS_REPO_PATH Absolute path to the cloned repo on the VPS,
+#                 e.g. /home/ubuntu/playable_tracking
+#
+# ── One-time manual pre-requisite (NOT a GitHub Secret, NOT in CI) ────────────
+#
+#   The BigQuery service-account key must be present on the VPS at:
+#     <VPS_REPO_PATH>/app/credentials/pixel-writer-key.json
+#   scripts/deploy-prod.sh exits 1 immediately if this file is missing.
+#   Seed it once:
+#     scp pixel-writer-key.json <VPS_USER>@<VPS_HOST>:<VPS_REPO_PATH>/app/credentials/
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'scripts/**'
+      - 'Dockerfile'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# Prevent two deploys running concurrently.
+# A newer push cancels an in-progress deploy from an older push.
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: Test ───────────────────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite
+        run: npm test
+
+  # ── Job 2: Deploy (only after tests pass) ─────────────────────────────────────
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load SSH key into agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      # Use the hashed (-H) form so the known_hosts entry is not plaintext.
+      # Default SSH port to 22 when VPS_PORT secret is empty or not set.
+      - name: Add VPS host key to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          PORT="${{ secrets.VPS_PORT }}"
+          PORT="${PORT:-22}"
+          ssh-keyscan -p "$PORT" -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Pull & deploy on VPS
+        timeout-minutes: 15
+        run: |
+          PORT="${{ secrets.VPS_PORT }}"
+          PORT="${PORT:-22}"
+          ssh -p "$PORT" ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
+            'set -e; cd ${{ secrets.VPS_REPO_PATH }}; git fetch origin main; git reset --hard origin/main; ./scripts/deploy-prod.sh'
+
+      - name: Verify health endpoint
+        run: |
+          PORT="${{ secrets.VPS_PORT }}"
+          PORT="${PORT:-22}"
+          ssh -p "$PORT" ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
+            'curl -fsS http://127.0.0.1:9000/health'

@@ -81,37 +81,21 @@ const resolveTableName = (event) => {
 
 const hashEvent = (event) => {
     const payload = JSON.stringify({
-        requestTime: event.time || "",
-        clientTimestamp: event.clientTimestamp || "",
-        event: event.event || "",
-        pid: event.pid || "",
-        playableId: event.playableId || "",
         sid: event.sid || "",
-        platform: event.platform || "",
-        trackingEnvironment: event.trackingEnvironment || "test",
-        campaignRaw: event.campaignRaw || {},
+        event: event.event || "",
+        eventTime: event.eventTime || "",
         params: event.params || {},
-        ip: event.ip || "",
-        ua: event.ua || "",
-        ref: event.ref || "",
     });
 
     return crypto.createHash("sha256").update(payload).digest("hex");
 };
 
 const buildRow = (event) => ({
-    event_time: event.time,
-    event_name: event.event,
-    package_name: event.pid,
-    playable_id: event.playableId || "",
     session_id: event.sid,
-    platform: event.platform || "",
-    campaign_raw: event.campaignRaw || {},
-    event_params: event.params || {},
-    ip: event.ip,
-    user_agent: event.ua,
-    referer: event.ref,
+    event_name: event.event,
+    event_time: event.eventTime,
     received_at: new Date().toISOString(),
+    event_params: event.params || {},
     event_hash: hashEvent(event),
 });
 
@@ -458,13 +442,6 @@ const normalizeLogEntry = (event, row, logEntry) => {
         payload.event_params === null
     ) {
         payload.event_params = (event && event.params) || safeParseJSON(payload.event_params);
-    }
-
-    if (
-        typeof payload.campaign_raw !== "object" ||
-        payload.campaign_raw === null
-    ) {
-        payload.campaign_raw = (event && event.campaignRaw) || safeParseJSON(payload.campaign_raw);
     }
 
     return payload;
