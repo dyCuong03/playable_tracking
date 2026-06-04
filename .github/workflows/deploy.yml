@@ -92,7 +92,7 @@ jobs:
           PORT="${{ secrets.VPS_PORT }}"
           PORT="${PORT:-22}"
           ssh -p "$PORT" ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
-            'set -e; cd ${{ secrets.VPS_REPO_PATH }}; git fetch origin main; git reset --hard origin/main; ./scripts/deploy-prod.sh'
+            'set -e; cd ${{ secrets.VPS_REPO_PATH }}; git fetch origin main; git reset --hard origin/main; bash ./scripts/deploy-prod.sh'
 
       - name: Verify health endpoint
         run: |
