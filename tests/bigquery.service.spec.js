@@ -49,8 +49,8 @@ test("buildRow does not include legacy top-level fields", () => {
     }));
 
     const forbidden = [
-        "platform", "campaign_raw", "user_agent", "ip",
-        "referer", "e", "pid", "ua", "ref", "time",
+        "platform", "campaign_raw", "user_agent",
+        "e", "pid", "ua", "ref", "time",
     ];
     for (const key of forbidden) {
         assert.equal(key in row, false, `buildRow must not include top-level field "${key}"`);

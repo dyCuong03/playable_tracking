@@ -260,7 +260,7 @@ test("queued row for end event has event_params with interact_count", async () =
 
 // ─── Row content: no forbidden top-level fields ───────────────────────────────
 
-test("queued row has no top-level platform, campaign_raw, user_agent, ip, or referer fields", async () => {
+test("queued row has no top-level platform, campaign_raw, or user_agent fields", async () => {
     await request(app)
         .get("/p.gif")
         .query({
@@ -277,7 +277,7 @@ test("queued row has no top-level platform, campaign_raw, user_agent, ip, or ref
 
     assert.ok(row, "Row for sess-nofld-1 not found");
 
-    const forbidden = ["platform", "campaign_raw", "user_agent", "ip", "referer"];
+    const forbidden = ["platform", "campaign_raw", "user_agent"];
     for (const key of forbidden) {
         assert.equal(key in row, false, `Row must not have top-level field "${key}"`);
     }

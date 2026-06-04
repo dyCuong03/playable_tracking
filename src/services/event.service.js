@@ -121,6 +121,8 @@ exports.buildEvent = (req) => {
         eventTime: resolveEventTime(query),
         packageName: query.pid || query.package_name || query.project_id || "",
         playableId: query.playableId || query.playable_id || "",
+        ip: req.ip || "",
+        referer: query.ref || (typeof req.get === "function" ? req.get("referer") : "") || "",
         params,
         trackingEnvironment: resolveTrackingEnvironment(query),
     };

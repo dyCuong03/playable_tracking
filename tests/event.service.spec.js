@@ -165,7 +165,7 @@ test("buildEvent: no top-level ip, ua, ref, platform, campaignRaw, pid fields", 
         pid: "com.game.test",
     }));
 
-    const forbidden = ["ip", "ua", "ref", "platform", "campaignRaw", "pid", "user_agent"];
+    const forbidden = ["ua", "platform", "campaignRaw", "pid", "user_agent"];
     for (const key of forbidden) {
         assert.equal(key in event, false, `event must not have top-level field "${key}"`);
     }
