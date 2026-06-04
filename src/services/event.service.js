@@ -119,6 +119,8 @@ exports.buildEvent = (req) => {
         event: eventName,
         sid: query.sid || query.session_id || "",
         eventTime: resolveEventTime(query),
+        packageName: query.pid || query.package_name || query.project_id || "",
+        playableId: query.playableId || query.playable_id || "",
         params,
         trackingEnvironment: resolveTrackingEnvironment(query),
     };

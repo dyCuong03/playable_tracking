@@ -277,8 +277,30 @@ test("queued row has no top-level platform, campaign_raw, user_agent, ip, or ref
 
     assert.ok(row, "Row for sess-nofld-1 not found");
 
-    const forbidden = ["platform", "campaign_raw", "user_agent", "ip", "referer", "package_name", "playable_id"];
+    const forbidden = ["platform", "campaign_raw", "user_agent", "ip", "referer"];
     for (const key of forbidden) {
         assert.equal(key in row, false, `Row must not have top-level field "${key}"`);
     }
+});
+
+test("queued row carries package_name + playable_id from query (pid / playable_id)", async () => {
+    await request(app)
+        .get("/p.gif")
+        .query({
+            session_id: "sess-pkg-1",
+            event_name: "interaction",
+            event_time: "2026-06-04T10:04:00.000Z",
+            event_params: JSON.stringify({ name: "tap" }),
+            pid: "com.archer.cat.kitchen",
+            playable_id: "PA0006",
+        })
+        .expect(200);
+
+    await waitForQueueData();
+    const rows = await readAllQueuedRows();
+    const row = rows.find((r) => r.session_id === "sess-pkg-1");
+
+    assert.ok(row, "Row for sess-pkg-1 not found");
+    assert.equal(row.package_name, "com.archer.cat.kitchen");
+    assert.equal(row.playable_id, "PA0006");
 });

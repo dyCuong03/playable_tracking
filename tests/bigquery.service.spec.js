@@ -14,6 +14,8 @@ const makeEvent = (overrides = {}) => ({
     sid: "sess-001",
     event: "start",
     eventTime: "2026-06-04T10:00:00.000Z",
+    packageName: "com.archer.cat.kitchen",
+    playableId: "PA0006",
     params: { platform: "android", campaign: {} },
     trackingEnvironment: "test",
     ...overrides,
@@ -48,12 +50,24 @@ test("buildRow does not include legacy top-level fields", () => {
 
     const forbidden = [
         "platform", "campaign_raw", "user_agent", "ip",
-        "referer", "package_name", "playable_id",
-        "e", "pid", "ua", "ref", "time",
+        "referer", "e", "pid", "ua", "ref", "time",
     ];
     for (const key of forbidden) {
         assert.equal(key in row, false, `buildRow must not include top-level field "${key}"`);
     }
+});
+
+test("buildRow includes package_name and playable_id as top-level columns", () => {
+    const row = buildRow(makeEvent({
+        sid: "sess-pkg",
+        event: "interaction",
+        packageName: "com.archer.cat.kitchen",
+        playableId: "PA0006",
+        params: { name: "tap" },
+    }));
+
+    assert.equal(row.package_name, "com.archer.cat.kitchen");
+    assert.equal(row.playable_id, "PA0006");
 });
 
 test("buildRow: received_at is a valid server-generated ISO timestamp", () => {

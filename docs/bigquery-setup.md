@@ -18,6 +18,8 @@ Follow these steps to make sure every `/p.gif` event is pushed to BigQuery while
      session_id   STRING    NOT NULL,
      event_name   STRING    NOT NULL,
      event_time   TIMESTAMP NOT NULL,
+     package_name STRING,
+     playable_id  STRING,
      received_at  TIMESTAMP NOT NULL,
      event_params STRING,
      event_hash   STRING
@@ -29,6 +31,8 @@ Follow these steps to make sure every `/p.gif` event is pushed to BigQuery while
      session_id   STRING    NOT NULL,
      event_name   STRING    NOT NULL,
      event_time   TIMESTAMP NOT NULL,
+     package_name STRING,
+     playable_id  STRING,
      received_at  TIMESTAMP NOT NULL,
      event_params STRING,
      event_hash   STRING
@@ -40,10 +44,10 @@ Follow these steps to make sure every `/p.gif` event is pushed to BigQuery while
    `event_params` is stored as a JSON string. `event_time` is the client-reported timestamp;
    `received_at` is the server arrival time stamped automatically — never trust `event_time` alone for ordering.
 
-   **Existing deployments (zero migration):** If your tables were created with the old schema, they contain
-   seven additional legacy columns (`platform`, `campaign_raw`, `package_name`, `playable_id`, `ip`,
-   `user_agent`, `referer`). The server no longer writes those columns — new rows will have `NULL` in them.
-   No `ALTER TABLE` is required to keep the server running. See §6 for optional cleanup DDL to drop them.
+   **Existing deployments (zero migration):** Old-schema tables already contain `package_name` and
+   `playable_id` (the server writes these) plus five legacy columns the server no longer writes
+   (`platform`, `campaign_raw`, `ip`, `user_agent`, `referer`) — new rows leave those five `NULL`.
+   No `ALTER TABLE` is required to keep the server running. See §6 for optional cleanup DDL to drop the five.
 
 3. Provision a service account with permission to insert rows through the Cloud Console:
    1. Go to https://console.cloud.google.com/iam-admin/serviceaccounts.
@@ -156,9 +160,10 @@ ORDER BY event_time ASC;
 
 ## 6. Optional cleanup DDL
 
-The server no longer writes the seven legacy columns (`platform`, `campaign_raw`, `package_name`,
-`playable_id`, `ip`, `user_agent`, `referer`). They remain in existing tables with `NULL` on all new rows.
-The server works correctly whether or not these columns are present — this cleanup is purely cosmetic.
+The server no longer writes five legacy columns (`platform`, `campaign_raw`, `ip`, `user_agent`,
+`referer`). They remain in existing tables with `NULL` on all new rows. The server works correctly
+whether or not these columns are present — this cleanup is purely cosmetic.
+(Do **not** drop `package_name` or `playable_id` — the server still writes those.)
 
 **Before running:** BigQuery requires a column to have no streaming-buffer or time-travel data before it
 can be dropped. Wait at least 7 days after the last write to any of these columns (i.e., after fully
@@ -169,8 +174,6 @@ replacing the old server version) and back up any historical values you want to 
 ALTER TABLE `playable_tracking.pixel_events_ver_2`
   DROP COLUMN IF EXISTS platform,
   DROP COLUMN IF EXISTS campaign_raw,
-  DROP COLUMN IF EXISTS package_name,
-  DROP COLUMN IF EXISTS playable_id,
   DROP COLUMN IF EXISTS ip,
   DROP COLUMN IF EXISTS user_agent,
   DROP COLUMN IF EXISTS referer;
@@ -179,8 +182,6 @@ ALTER TABLE `playable_tracking.pixel_events_ver_2`
 ALTER TABLE `playable_tracking.pixel_events_production`
   DROP COLUMN IF EXISTS platform,
   DROP COLUMN IF EXISTS campaign_raw,
-  DROP COLUMN IF EXISTS package_name,
-  DROP COLUMN IF EXISTS playable_id,
   DROP COLUMN IF EXISTS ip,
   DROP COLUMN IF EXISTS user_agent,
   DROP COLUMN IF EXISTS referer;

@@ -94,6 +94,8 @@ const buildRow = (event) => ({
     session_id: event.sid,
     event_name: event.event,
     event_time: event.eventTime,
+    package_name: event.packageName || "",
+    playable_id: event.playableId || "",
     received_at: new Date().toISOString(),
     event_params: event.params || {},
     event_hash: hashEvent(event),
