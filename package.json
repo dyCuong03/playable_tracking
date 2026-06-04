@@ -8,7 +8,7 @@
     "start:worker": "node src/worker.js",
     "start:dispatcher": "node src/dispatcher.js",
     "test:tracking": "node scripts/test-tracking.js",
-    "test": "node --test --test-concurrency=1 tests/**/*.spec.js"
+    "test": "node --test --test-concurrency=1 tests/*.spec.js"
   },
   "repository": {
     "type": "git",
