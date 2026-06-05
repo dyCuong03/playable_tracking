@@ -1,0 +1,46 @@
+# .github/workflows/ops-validate.yml
+#
+# Validates the ops/ monitoring toolkit: bash syntax + the daemon-reconcile test
+# suite. Runs on PRs and pushes that touch ops/**. Any syntax error or test
+# failure fails the workflow. It does NOT run the loadtester — load testing is
+# manual/scheduled only (see ops/README.md).
+
+name: ops validation
+
+on:
+  pull_request:
+    paths:
+      - 'ops/**'
+      - '.github/workflows/ops-validate.yml'
+  push:
+    paths:
+      - 'ops/**'
+      - '.github/workflows/ops-validate.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check (ops/bin, ops/lib, ops/tests)
+        run: |
+          set -u
+          fail=0
+          for f in ops/bin/*.sh ops/lib/*.sh ops/tests/*.sh; do
+            [ -e "$f" ] || continue
+            if bash -n "$f"; then
+              echo "ok    $f"
+            else
+              echo "FAIL  $f"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      - name: Node syntax check (hammer.js)
+        run: node -c ops/bin/hammer.js
+
+      - name: Run daemon-reconcile test suite
+        run: bash ops/tests/reconcile.test.sh
