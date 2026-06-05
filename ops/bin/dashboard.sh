@@ -28,16 +28,21 @@ LOGS_CMD="while true; do clear; printf '== BACKEND LOGS / ERROR ROLLUP ==\n\n'; 
 
 MON_CMD="while true; do clear; printf '== DAEMON HEALTH ==\n'; \
  bash '$BIN/ops-status.sh' table 2>/dev/null || echo 'ops-status unavailable'; \
+ printf '\n== DOCKER HEALTH ==\n'; \
+ bash '$BIN/ops-status.sh' docker 2>/dev/null || echo 'docker block unavailable'; \
  printf '\n== MONITOR (latest snapshot, truncated) ==\n'; \
  if [ -f '$STATUS_DIR/monitor-latest.json' ]; then python3 -m json.tool '$STATUS_DIR/monitor-latest.json' 2>/dev/null | grep -vE '^[[:space:]]*[{}][,]?\$' | head -16; else echo 'no snapshot yet — monitor not run'; fi; \
  sleep $REFRESH; done"
 
 CAP_CMD="while true; do clear; printf '== LOAD CAPACITY (trend) ==\n\n'; \
- if [ -x '$BIN/capacity-trend.sh' ]; then bash '$BIN/capacity-trend.sh' 2>/dev/null; else echo 'capacity-trend.sh not ready'; fi; \
+ hist='$REPORTS_DIR/capacity-history.ndjson'; \
+ if [ -s \"\$hist\" ] && [ -x '$BIN/capacity-trend.sh' ]; then bash '$BIN/capacity-trend.sh' 2>/dev/null; \
+ else printf 'No capacity history yet.\nStress testing is DISABLED by default (CAPACITY_ENABLED=0, LOADTEST_ENABLED=0).\nManual run (NON-production target):\n  LOADTEST_ENABLED=1 CAPACITY_ENABLED=1 bash ops/bin/stress.sh\nScheduled runs: CAPACITY_ENABLED=1 bash ops/bin/ops-start.sh\n'; fi; \
  sleep $((REFRESH*3)); done"
 
 PLAN_CMD="while true; do clear; printf '== LOAD-BEARING PLAN (sizing) ==\n\n'; \
- if [ -f '$STATUS_DIR/capacity-plan.json' ]; then python3 -m json.tool '$STATUS_DIR/capacity-plan.json' 2>/dev/null | head -28; else echo 'no plan yet — run plan.sh'; fi; \
+ if [ -f '$STATUS_DIR/capacity-plan.json' ]; then python3 -m json.tool '$STATUS_DIR/capacity-plan.json' 2>/dev/null | head -26; echo; echo 'Full plan: $REPORTS_DIR/capacity-plan.md'; \
+ else printf 'No plan yet. Generate a baseline plan (no loadtest required):\n  bash ops/bin/plan.sh\nWrites: $REPORTS_DIR/capacity-plan.md (+ status/capacity-plan.json)\n'; fi; \
  echo; echo '-- recent alerts --'; tail -n 8 '$STATUS_DIR/alerts.ndjson' 2>/dev/null || echo '(none)'; \
  sleep $REFRESH; done"
 

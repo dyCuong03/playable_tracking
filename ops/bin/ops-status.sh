@@ -3,11 +3,12 @@
 # Shows alive / cmd_ok / heartbeat_fresh / healthy / reason as SEPARATE fields,
 # so a ghost pidfile (alive=true, cmd_ok=false) can never read as healthy.
 #
-# Usage: ops-status.sh [table|json|gate]   (default: table)
+# Usage: ops-status.sh [table|json|gate|docker]   (default: table)
 #   table  human-readable table (always exit 0)
 #   json   JSON array of per-daemon status objects (always exit 0)
 #   gate   print the table, then exit 1 if ANY daemon is unhealthy
 #          (used by CI / post-deploy to fail the pipeline on bad health)
+#   docker render the docker-health block from monitor-latest.json (read-only)
 set -u
 . "$(dirname "$0")/../lib/common.sh"
 
@@ -38,9 +39,47 @@ for line in sys.stdin:
 '
 }
 
+render_docker() {
+    LATEST="$STATUS_DIR/monitor-latest.json" python3 - <<'PY'
+import json, os, sys
+p = os.environ["LATEST"]
+try:
+    d = json.load(open(p)).get("docker", {})
+except Exception:
+    d = {}
+if not d:
+    print("no docker data yet — monitor not run")
+    sys.exit()
+if not d.get("available") or not d.get("permission_ok"):
+    print("Docker unavailable or permission denied.")
+    print("Try: sudo usermod -aG docker $USER, then re-login.")
+    st = d.get("state") or d.get("status")
+    if st:
+        print("(%s)" % st)
+    sys.exit()
+cs = d.get("containers", [])
+if not cs:
+    print("docker ok — no containers found (set OPS_DOCKER_CONTAINERS to assert expected ones)")
+    sys.exit()
+fmt = "%-15s %-11s %-9s %-9s %-22s %s"
+print(fmt % ("CONTAINER", "STATE", "HEALTH", "RESTARTS", "PORTS", "REASON"))
+for c in cs:
+    r = c.get("restarts")
+    r = "-" if r is None else r
+    print(fmt % (
+        str(c.get("name", "?"))[:15], str(c.get("state", "?"))[:11],
+        str(c.get("health", "n/a"))[:9], str(r)[:9],
+        str(c.get("ports", "-"))[:22], c.get("reason", "")))
+PY
+}
+
 DATA="$(collect)"
 
 case "$fmt" in
+docker)
+    render_docker
+    exit 0
+    ;;
 json)
     printf '%s\n' "$DATA" | python3 -c 'import sys,json; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()], indent=2))'
     ;;

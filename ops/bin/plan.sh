@@ -74,20 +74,25 @@ if verdict_file and os.path.exists(verdict_file):
     except Exception as e:
         assumptions.append(f"Could not parse {verdict_file} ({e}); fell back to documented baseline.")
 
-if verdict and verdict.get("sustainable_rps"):
+measured_capacity_available = bool(verdict and verdict.get("sustainable_rps"))
+if measured_capacity_available:
     sustainable_rps = float(verdict["sustainable_rps"])
     knee = verdict.get("knee_concurrency")
     last_good = verdict.get("last_good_concurrency")
     baseline_src = os.path.basename(verdict_file)
     baseline_run = verdict.get("run_id", "n/a")
 else:
-    # Documented fallback from ops/reports/loadtest-2026-06-05.md
+    # Documented placeholder from ops/reports/loadtest-2026-06-05.md — NOT measured this run.
     sustainable_rps = 1178.8
     knee = 400
     last_good = 200
-    baseline_src = "DOCUMENTED FALLBACK (no verdict file)"
+    baseline_src = "PLACEHOLDER (no measured capacity)"
     baseline_run = "n/a"
-    assumptions.append("No stress verdict found; used documented baseline sustainable_rps=1178.8, knee=400, last_good=200.")
+    assumptions.append("MEASURED CAPACITY UNAVAILABLE — no stress verdict found. "
+                       "Using placeholder baseline sustainable_rps=1178.8, knee=400, last_good=200. "
+                       "Loadtesting is OFF by default and must be enabled manually: "
+                       "LOADTEST_ENABLED=1 CAPACITY_ENABLED=1 bash ops/bin/stress.sh (NON-production target). "
+                       "Re-run plan.sh after a real stress run to replace this placeholder.")
 
 knee = knee if knee is not None else 400
 last_good = last_good if last_good is not None else 200
@@ -189,6 +194,7 @@ if history_file and os.path.exists(history_file):
 with open(plan_json, "w") as f:
     json.dump({
         "generated_at": generated_at,
+        "measured_capacity_available": measured_capacity_available,
         "baseline": {
             "sustainable_rps": sustainable_rps,
             "per_replica_rps": round(per_replica_rps, 1),
@@ -216,6 +222,13 @@ md = []
 md.append(f"# Optimal Load-Bearing Plan — pixel-tracking server\n")
 md.append(f"_Generated: {generated_at} by `ops/bin/plan.sh` (planner). "
           f"Re-run to regenerate from latest inputs._\n")
+
+if not measured_capacity_available:
+    md.append("\n> 🟡 **MEASURED CAPACITY UNAVAILABLE — this is a baseline/placeholder plan.**\n>\n"
+              "> No stress verdict exists yet, so the sizing below uses a documented placeholder, not a\n"
+              "> real measurement. Loadtesting is OFF by default and must be enabled manually:\n>\n"
+              "> ```\n> LOADTEST_ENABLED=1 CAPACITY_ENABLED=1 bash ops/bin/stress.sh   # NON-production target\n> ```\n>\n"
+              "> Then re-run `bash ops/bin/plan.sh` to replace the placeholder with measured numbers.\n")
 
 md.append("\n> ⚠️ **ASSUMPTION CONFLICT — read before trusting the sizing table.**\n>\n"
           f"> The briefing said to derive per-replica rps as `sustainable_rps / 8` (assuming the stress\n"

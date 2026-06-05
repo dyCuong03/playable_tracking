@@ -29,11 +29,17 @@ SUMMARY_FILE="$STATUS_DIR/logcollector-latest.json"
 ALERTS_FILE="$STATUS_DIR/alerts.ndjson"
 ERROR_SPIKE="${ERROR_SPIKE:-20}"
 
-CONTAINERS="pixel-server pixel-worker pixel-dispatcher redis nginx"
+# Operator-declared containers win; otherwise fall back to the known names.
+CONTAINERS="${OPS_DOCKER_CONTAINERS:-pixel-server pixel-worker pixel-dispatcher redis nginx}"
+DOCKER_SINCE="${LOGCOLLECT_DOCKER_SINCE:-10m}"
+DOCKER_TAIL="${LOGCOLLECT_DOCKER_TAIL:-500}"
 
-# error/warn matchers tolerate an optional space after the colon.
+# error/warn matchers for JSON-line app logs (tolerate a space after the colon).
 ERR_RE='"level":[[:space:]]*"error"'
 WARN_RE='"level":[[:space:]]*"warn"'
+# Broader matchers for raw container stdout/stderr (not necessarily JSON).
+GENERIC_ERR_RE='([Ee]rror|ERROR|[Ff]atal|FATAL|[Ee]xception|EXCEPTION|"level":[[:space:]]*"error")'
+GENERIC_WARN_RE='([Ww]arn|WARN|"level":[[:space:]]*"warn")'
 
 # ---- offset store -----------------------------------------------------------
 # Loaded once into an associative array, written once at the end.
@@ -93,14 +99,16 @@ count_re() {
     echo "${n:-0}"
 }
 
-# record_source NAME NEW_LINES_FILE
+# record_source NAME NEW_LINES_FILE [ERR_RE] [WARN_RE]
+# App logs use the JSON-level regexes (default); container logs pass the broader
+# generic matchers so plain error/fatal/exception lines are counted too.
 record_source() {
-    local name="$1" tmp="$2"
+    local name="$1" tmp="$2" err_re="${3:-$ERR_RE}" warn_re="${4:-$WARN_RE}"
     local lines errs warns
     lines=$(wc -l < "$tmp" 2>/dev/null | tr -d ' ')
     lines="${lines:-0}"
-    errs=$(count_re "$tmp" "$ERR_RE")
-    warns=$(count_re "$tmp" "$WARN_RE")
+    errs=$(count_re "$tmp" "$err_re")
+    warns=$(count_re "$tmp" "$warn_re")
     SRC_NAMES+=("$name")
     SRC_LINES+=("$lines")
     SRC_ERRS+=("$errs")
@@ -139,21 +147,20 @@ collect_incremental "local-server.err"  "$REPO_DIR/logs/local-server.err.log" "$
 # ---- 2. container logs ------------------------------------------------------
 DOCKER_UNAVAIL="$CONTDIR/_docker-unavailable.log"
 DOCKER_REASONS="$(mktemp)"
-docker_ok=0
-if command -v docker >/dev/null 2>&1; then
-    if docker info >/dev/null 2>&1; then
-        docker_ok=1
-    fi
-fi
+# DOCKER_STATUS is surfaced in the summary + rollup so a bare sources=0 is never
+# mistaken for "all quiet" when docker is actually blocked by permission.
+read DOCKER_AVAIL DOCKER_PERM DOCKER_STATE <<<"$(docker_access)"
+DOCKER_STATUS="$DOCKER_STATE"
+DOCKER_WARNING=""
 
-if [ "$docker_ok" = "1" ]; then
+if [ "$DOCKER_STATE" = "ok" ]; then
     present="$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)"
     for c in $CONTAINERS; do
         if printf '%s\n' "$present" | grep -qx "$c"; then
             tmp="$(mktemp)"
-            if docker logs --tail 500 "$c" > "$tmp" 2>&1; then
+            if docker logs --since "$DOCKER_SINCE" --tail "$DOCKER_TAIL" "$c" > "$tmp" 2>&1; then
                 cat "$tmp" > "$CONTDIR/$c.log"
-                record_source "container:$c" "$tmp"
+                record_source "container:$c" "$tmp" "$GENERIC_ERR_RE" "$GENERIC_WARN_RE"
             else
                 jlog "warn" "$ROLE" "docker logs failed for container" "{\"container\":$(json_str "$c")}" >> "$DOCKER_REASONS"
             fi
@@ -162,8 +169,15 @@ if [ "$docker_ok" = "1" ]; then
             jlog "warn" "$ROLE" "container absent - skipped" "{\"container\":$(json_str "$c")}" >> "$DOCKER_REASONS"
         fi
     done
+elif [ "$DOCKER_STATE" = "permission_denied" ]; then
+    DOCKER_WARNING="docker permission denied — add the deploy user to the docker group (sudo usermod -aG docker \$USER, then re-login) so container logs can be collected."
+    jlog "warn" "$ROLE" "docker permission denied - container logs skipped" "{\"reason\":\"permission_denied\"}" >> "$DOCKER_REASONS"
+elif [ "$DOCKER_STATE" = "no_cli" ]; then
+    DOCKER_WARNING="docker CLI not installed — container logs not collected."
+    jlog "warn" "$ROLE" "docker CLI missing - container logs skipped" "{\"reason\":\"no_cli\"}" >> "$DOCKER_REASONS"
 else
-    jlog "warn" "$ROLE" "docker unavailable - container logs skipped" "{\"reason\":\"docker daemon unreachable or not installed\"}" >> "$DOCKER_REASONS"
+    DOCKER_WARNING="docker daemon unreachable — container logs not collected."
+    jlog "warn" "$ROLE" "docker daemon unreachable - container logs skipped" "{\"reason\":\"no_daemon\"}" >> "$DOCKER_REASONS"
 fi
 
 if [ -s "$DOCKER_REASONS" ]; then
@@ -188,17 +202,22 @@ write_offsets
 ROLLUP="$DAYDIR/errors-rollup.txt"
 {
     printf '# errors-rollup %s (generated %s)\n' "$DATE" "$(ts_now)"
-    printf '# error/warn lines per collected JSON-line source (last 200 each)\n\n'
+    printf '# error/warn lines per collected source (last 200 each)\n'
+    printf '# docker_status=%s' "$DOCKER_STATUS"
+    [ -n "$DOCKER_WARNING" ] && printf '  WARNING: %s' "$DOCKER_WARNING"
+    printf '\n\n'
     shopt -s nullglob
     for f in "$DAYDIR/app.log" "$DAYDIR/local-server.out.log" "$DAYDIR/local-server.err.log" "$CONTDIR"/*.log; do
         [ -f "$f" ] || continue
         case "$(basename "$f")" in _docker-unavailable.log) continue;; esac
-        ec=$(count_re "$f" "$ERR_RE")
-        wc_=$(count_re "$f" "$WARN_RE")
+        # Container logs are raw stdout/stderr -> use the broader matchers.
+        case "$f" in "$CONTDIR"/*) e_re="$GENERIC_ERR_RE"; w_re="$GENERIC_WARN_RE";; *) e_re="$ERR_RE"; w_re="$WARN_RE";; esac
+        ec=$(count_re "$f" "$e_re")
+        wc_=$(count_re "$f" "$w_re")
         rel="${f#$DAYDIR/}"
         printf '=== %s : errors=%s warns=%s ===\n' "$rel" "$ec" "$wc_"
         if [ "$ec" -gt 0 ] || [ "$wc_" -gt 0 ]; then
-            grep -E "$ERR_RE|$WARN_RE" "$f" 2>/dev/null | tail -n 200
+            grep -E "$e_re|$w_re" "$f" 2>/dev/null | tail -n 200
         fi
         printf '\n'
     done
@@ -213,8 +232,36 @@ for i in "${!SRC_NAMES[@]}"; do
 done
 SOURCES_JSON+="]"
 
-SUMMARY="{\"ts\":\"$(ts_now)\",\"role\":\"$ROLE\",\"date\":\"$DATE\",\"sources\":$SOURCES_JSON,\"total_errors\":$TOTAL_ERR,\"total_warns\":$TOTAL_WARN}"
+DOCKER_JSON_SUMMARY="{\"status\":$(json_str "$DOCKER_STATUS"),\"available\":${DOCKER_AVAIL},\"permission_ok\":${DOCKER_PERM}"
+[ -n "$DOCKER_WARNING" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"warning\":$(json_str "$DOCKER_WARNING")"
+DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"containers_watched\":$(json_str "$CONTAINERS")}"
+
+SUMMARY="{\"ts\":\"$(ts_now)\",\"role\":\"$ROLE\",\"date\":\"$DATE\",\"sources\":$SOURCES_JSON,\"source_count\":${#SRC_NAMES[@]},\"total_errors\":$TOTAL_ERR,\"total_warns\":$TOTAL_WARN,\"docker\":$DOCKER_JSON_SUMMARY}"
 printf '%s\n' "$SUMMARY" > "$SUMMARY_FILE"
+
+# Raise a deduped alert when docker is blocked so sources=0 is explained, not silent.
+DOCKER_ALERT_ACTIVE=0
+case "$DOCKER_STATUS" in permission_denied|no_daemon) DOCKER_ALERT_ACTIVE=1;; esac
+prev_docker=0
+DOCKER_ALERT_STATE="$STATUS_DIR/logcollector-docker-alert-state.json"
+if [ -f "$DOCKER_ALERT_STATE" ]; then
+    prev_docker=$(python3 - "$DOCKER_ALERT_STATE" <<'PY' 2>/dev/null || echo 0
+import json, sys
+try:
+    print(1 if json.load(open(sys.argv[1])).get("blocked") else 0)
+except Exception:
+    print(0)
+PY
+)
+fi
+if [ "$DOCKER_ALERT_ACTIVE" = "1" ] && [ "$prev_docker" != "1" ]; then
+    printf '{"ts":"%s","role":"%s","severity":"warn","event":"docker-logs-unavailable","detail":%s}\n' \
+        "$(ts_now)" "$ROLE" "$(json_str "$DOCKER_WARNING")" >> "$ALERTS_FILE"
+elif [ "$DOCKER_ALERT_ACTIVE" = "0" ] && [ "$prev_docker" = "1" ]; then
+    printf '{"ts":"%s","role":"%s","severity":"info","event":"docker-logs-unavailable-recovered","detail":"docker log collection restored"}\n' \
+        "$(ts_now)" "$ROLE" >> "$ALERTS_FILE"
+fi
+printf '{"blocked":%s,"status":%s}\n' "$([ "$DOCKER_ALERT_ACTIVE" = 1 ] && echo true || echo false)" "$(json_str "$DOCKER_STATUS")" > "$DOCKER_ALERT_STATE"
 
 # ---- 6. error-spike alert (deduped via state file) --------------------------
 prev_spike=0

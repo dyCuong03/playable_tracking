@@ -100,20 +100,83 @@ check_alert() {
 # ---------------------------------------------------------------------------
 
 read HEALTH_CODE HEALTH_MS <<<"$(probe "$HEALTH_URL")"
-read PIXEL_CODE  PIXEL_MS  <<<"$(probe "$PIXEL_URL")"
 
-# --- Redis stream depth ---
-if command -v redis-cli >/dev/null 2>&1; then
-    REDIS_ARGS=()
-    [ -n "${REDIS_URL:-}" ] && REDIS_ARGS=(-u "$REDIS_URL")
-    XLEN="$(redis-cli "${REDIS_ARGS[@]}" XLEN "$REDIS_STREAM" 2>/dev/null)"
-    [ -z "$XLEN" ] && XLEN=0
-    # XPENDING summary: first token is the pending count.
-    XPEND="$(redis-cli "${REDIS_ARGS[@]}" XPENDING "$REDIS_STREAM" "$REDIS_GROUP" 2>/dev/null | head -n1 | tr -d ' \r')"
-    case "$XPEND" in (*[!0-9]*|"") XPEND=0;; esac
-    REDIS_JSON="{\"stream\":$(json_str "$REDIS_STREAM"),\"xlen\":${XLEN},\"pending\":${XPEND}}"
+# --- Pixel endpoint probe (configurable; bare /p.gif returns 400 by design) ---
+# A valid pixel request needs e=<start|interaction|store_trigger|end>, sid, and
+# per-event params; a bare /p.gif has none, so 400 is EXPECTED. Operators point
+# OPS_PIXEL_PROBE_PATH/URL at a valid synthetic event (marked ops_healthcheck,
+# env!=production so it lands in the ver_2 table, not real analytics).
+PIXEL_EXPECT="${OPS_PIXEL_EXPECT_CODE:-200}"
+PIXEL_CONFIGURED=0
+if [ -n "${OPS_PIXEL_PROBE_URL:-}" ]; then
+    PIXEL_PROBE_URL="$OPS_PIXEL_PROBE_URL"; PIXEL_CONFIGURED=1
+elif [ -n "${OPS_PIXEL_PROBE_PATH:-}" ]; then
+    PIXEL_PROBE_URL="${PIXEL_BASE}${OPS_PIXEL_PROBE_PATH}"; PIXEL_CONFIGURED=1
 else
-    REDIS_JSON="{\"status\":\"cli_missing\"}"
+    PIXEL_PROBE_URL="$PIXEL_URL"
+fi
+read PIXEL_CODE PIXEL_MS <<<"$(probe "$PIXEL_PROBE_URL")"
+if [ "$PIXEL_CODE" = "$PIXEL_EXPECT" ]; then PIXEL_OK=true; else PIXEL_OK=false; fi
+PIXEL_NOTE=""
+if [ "$PIXEL_OK" != "true" ] && [ "$PIXEL_CONFIGURED" = "0" ]; then
+    PIXEL_NOTE='bare /p.gif probe has no query params; http 400 is EXPECTED. Set OPS_PIXEL_PROBE_PATH to a valid synthetic event (e.g. /p.gif?e=interaction&sid=ops_healthcheck&env=ops&event_params=%7B%22name%22%3A%22ops_healthcheck%22%7D) to probe the real ingest path.'
+fi
+PIXEL_JSON="{\"url\":$(json_str "$PIXEL_PROBE_URL"),\"http_code\":$(json_str "$PIXEL_CODE"),\"expected_code\":$(json_str "$PIXEL_EXPECT"),\"ok\":${PIXEL_OK},\"latency_ms\":${PIXEL_MS},\"configured\":$([ "$PIXEL_CONFIGURED" = 1 ] && echo true || echo false)"
+[ -n "$PIXEL_NOTE" ] && PIXEL_JSON="${PIXEL_JSON},\"note\":$(json_str "$PIXEL_NOTE")"
+PIXEL_JSON="${PIXEL_JSON}}"
+
+# --- Docker access classification (shared, read-only) ---
+read DOCKER_AVAIL DOCKER_PERM DOCKER_STATE <<<"$(docker_access)"
+
+# --- Redis queue depth (host redis-cli first, docker exec fallback) ---
+REDIS_KEY="${OPS_REDIS_QUEUE_KEY:-$REDIS_STREAM}"
+REDIS_CONTAINER="${OPS_REDIS_CONTAINER:-}"
+REDIS_METHOD=""
+REDIS_DEPTH=""
+REDIS_OK=0
+
+# redis_query <redis-cli invocation...> — echo depth of REDIS_KEY (stream XLEN
+# first, list LLEN fallback) or empty on failure. Read-only commands only.
+redis_query() {
+    local d
+    d="$("$@" XLEN "$REDIS_KEY" 2>/dev/null)"
+    case "$d" in (''|*[!0-9]*) d="";; esac
+    if [ -z "$d" ]; then
+        d="$("$@" LLEN "$REDIS_KEY" 2>/dev/null)"
+        case "$d" in (''|*[!0-9]*) d="";; esac
+    fi
+    printf '%s' "$d"
+}
+
+REDIS_HOST_CLI=0
+if command -v redis-cli >/dev/null 2>&1; then
+    REDIS_HOST_CLI=1
+    REDIS_ARGS=(redis-cli)
+    [ -n "${REDIS_URL:-}" ] && REDIS_ARGS=(redis-cli -u "$REDIS_URL")
+    REDIS_DEPTH="$(redis_query "${REDIS_ARGS[@]}")"
+    [ -n "$REDIS_DEPTH" ] && { REDIS_METHOD="host_cli"; REDIS_OK=1; }
+fi
+if [ "$REDIS_OK" = "0" ] && [ -n "$REDIS_CONTAINER" ] && [ "$DOCKER_STATE" = "ok" ]; then
+    REDIS_DEPTH="$(redis_query docker exec "$REDIS_CONTAINER" redis-cli)"
+    if [ -n "$REDIS_DEPTH" ]; then REDIS_METHOD="docker_exec"; REDIS_OK=1; fi
+fi
+
+REDIS_ALERT=0; REDIS_DETAIL=""
+if [ "$REDIS_OK" = "1" ]; then
+    if [ "$REDIS_METHOD" = "docker_exec" ]; then
+        REDIS_JSON="{\"status\":\"ok\",\"method\":\"docker_exec\",\"container\":$(json_str "$REDIS_CONTAINER"),\"queue_key\":$(json_str "$REDIS_KEY"),\"depth\":${REDIS_DEPTH}}"
+    else
+        REDIS_JSON="{\"status\":\"ok\",\"method\":\"host_cli\",\"queue_key\":$(json_str "$REDIS_KEY"),\"depth\":${REDIS_DEPTH}}"
+    fi
+    REDIS_DETAIL="redis depth ${REDIS_DEPTH} (key ${REDIS_KEY}) via ${REDIS_METHOD}"
+elif [ -n "$REDIS_CONTAINER" ] || [ "$REDIS_HOST_CLI" = "1" ]; then
+    # Configured (a container named or host cli present) but unreadable -> alert.
+    REDIS_JSON="{\"status\":\"error\",\"method\":$(json_str "${REDIS_METHOD:-none}"),\"container\":$(json_str "$REDIS_CONTAINER"),\"queue_key\":$(json_str "$REDIS_KEY"),\"message\":\"redis configured but queue depth unreadable (daemon down, wrong key, or docker exec denied)\"}"
+    REDIS_ALERT=1
+    REDIS_DETAIL="redis configured (key ${REDIS_KEY}, container '${REDIS_CONTAINER:-none}') but depth unreadable"
+else
+    REDIS_JSON="{\"status\":\"not_configured\",\"message\":\"Set OPS_REDIS_CONTAINER and OPS_REDIS_QUEUE_KEY to enable Redis depth checks\"}"
+    REDIS_DETAIL="redis not configured"
 fi
 
 # --- Disk queue ---
@@ -143,9 +206,80 @@ P_SERVER="$(pcount 'src/server.js')"
 P_WORKER="$(pcount 'src/worker.js')"
 P_DISPATCH="$(pcount 'src/dispatcher.js')"
 DOCKER_PIXEL="null"
-if command -v docker >/dev/null 2>&1; then
-    DC="$(timeout 5 docker ps --format '{{.Names}}' 2>/dev/null | grep -c '^pixel-')" || DC=""
-    [ -n "$DC" ] && DOCKER_PIXEL="$DC"
+
+# --- Docker container health (read-only inspect) ---
+# DOCKER_HELPER_OUT carries a "DOCKER\t<json>" line plus "ALERT\t..." lines.
+DOCKER_HELPER_OUT=""
+if [ "$DOCKER_STATE" = "ok" ]; then
+    DOCKER_PIXEL="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c '^pixel-')" || DOCKER_PIXEL="null"
+    DOCKER_HELPER_OUT="$(OPS_DOCKER_CONTAINERS="${OPS_DOCKER_CONTAINERS:-}" python3 - <<'PY' 2>/dev/null || true
+import json, os, subprocess
+
+expected = os.environ.get("OPS_DOCKER_CONTAINERS", "").split()
+
+def d(*args):
+    try:
+        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=8)
+    except Exception:
+        class R:  # mimic a failed run
+            returncode = 1; stdout = ""; stderr = ""
+        return R()
+
+psmap = {}
+ps = d("ps", "-a", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}")
+if ps.returncode == 0:
+    for line in ps.stdout.splitlines():
+        p = line.split("\t")
+        if len(p) >= 4:
+            psmap[p[0]] = {"image": p[1], "status": p[2], "ports": p[3] or "-"}
+
+names = expected if expected else sorted(psmap.keys())
+containers = []
+alerts = []
+for n in names:
+    info = psmap.get(n)
+    if info is None:
+        containers.append({"name": n, "present": False, "state": "missing",
+                           "health": "n/a", "restarts": None, "ports": "-", "reason": "container not found"})
+        if expected:
+            alerts.append((n, 1, "error", "expected container %s not found" % n))
+        continue
+    state = health = "n/a"; restarts = None; started = ""
+    insp = d("inspect", "--format",
+             "{{.State.Status}}\t{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}\t{{.RestartCount}}\t{{.State.StartedAt}}", n)
+    if insp.returncode == 0:
+        f = insp.stdout.strip().split("\t")
+        state = f[0] if len(f) > 0 and f[0] else "n/a"
+        health = f[1] if len(f) > 1 and f[1] else "n/a"
+        try: restarts = int(f[2])
+        except Exception: restarts = None
+        started = f[3] if len(f) > 3 else ""
+    reason = "ok"; bad = False
+    if state in ("exited", "dead"):
+        bad = True; reason = "container %s" % state
+    elif state == "restarting":
+        bad = True; reason = "restarting"
+    elif health == "unhealthy":
+        bad = True; reason = "healthcheck unhealthy"
+    elif state != "running":
+        reason = state
+    containers.append({"name": n, "present": True, "image": info["image"], "state": state,
+                       "health": health, "restarts": restarts, "ports": info["ports"],
+                       "status": info["status"], "started": started, "reason": reason})
+    if expected:
+        alerts.append((n, 1 if bad else 0, "error", reason))
+
+obj = {"available": True, "permission_ok": True,
+       "expected_configured": bool(expected), "containers": containers}
+print("DOCKER\t" + json.dumps(obj))
+for (n, active, sev, detail) in alerts:
+    print("ALERT\t%s\t%d\t%s\t%s" % (n, active, sev, detail))
+PY
+)"
+    DOCKER_JSON="$(printf '%s\n' "$DOCKER_HELPER_OUT" | sed -n 's/^DOCKER\t//p')"
+    [ -z "$DOCKER_JSON" ] && DOCKER_JSON="{\"available\":true,\"permission_ok\":true,\"containers\":[],\"status\":\"docker_inspect_failed\"}"
+else
+    DOCKER_JSON="{\"available\":${DOCKER_AVAIL},\"permission_ok\":false,\"status\":\"docker_missing_or_permission_denied\",\"state\":$(json_str "$DOCKER_STATE")}"
 fi
 
 # --- System ---
@@ -165,7 +299,7 @@ read DISK_TOTAL DISK_USED DISK_AVAIL DISK_PCT <<<"$(df -Pk "$REPO_DIR" | awk 'NR
 # Snapshot JSON
 # ---------------------------------------------------------------------------
 SNAP="$(cat <<JSON
-{"ts":"$(ts_now)","role":"$ROLE","health":{"url":$(json_str "$HEALTH_URL"),"http_code":$(json_str "$HEALTH_CODE"),"latency_ms":${HEALTH_MS}},"pixel":{"url":$(json_str "$PIXEL_URL"),"http_code":$(json_str "$PIXEL_CODE"),"latency_ms":${PIXEL_MS}},"redis":${REDIS_JSON},"disk_queue":{"pending":{"files":${PEND_F},"bytes":${PEND_B}},"ready":{"files":${READY_F},"bytes":${READY_B}},"processing":{"files":${PROC_F},"bytes":${PROC_B}},"rejected":{"files":${REJ_F},"bytes":${REJ_B}},"total_files":${TOTAL_F},"total_bytes":${TOTAL_B},"backlog_files":${BACKLOG_F},"stuck_processing":${STUCK_COUNT},"oldest_processing_s":${OLDEST_PROC}},"processes":{"server":${P_SERVER},"worker":${P_WORKER},"dispatcher":${P_DISPATCH},"docker_pixel":${DOCKER_PIXEL}},"system":{"loadavg_1m":${LA1},"loadavg_5m":${LA5},"loadavg_15m":${LA15},"nproc":${NPROC},"mem_total_mb":${MEM_TOTAL},"mem_used_mb":${MEM_USED},"mem_free_mb":${MEM_FREE},"disk":{"total_kb":${DISK_TOTAL:-0},"used_kb":${DISK_USED:-0},"avail_kb":${DISK_AVAIL:-0},"use_pct":${DISK_PCT:-0}}}}
+{"ts":"$(ts_now)","role":"$ROLE","health":{"url":$(json_str "$HEALTH_URL"),"http_code":$(json_str "$HEALTH_CODE"),"latency_ms":${HEALTH_MS}},"pixel":${PIXEL_JSON},"redis":${REDIS_JSON},"docker":${DOCKER_JSON},"disk_queue":{"pending":{"files":${PEND_F},"bytes":${PEND_B}},"ready":{"files":${READY_F},"bytes":${READY_B}},"processing":{"files":${PROC_F},"bytes":${PROC_B}},"rejected":{"files":${REJ_F},"bytes":${REJ_B}},"total_files":${TOTAL_F},"total_bytes":${TOTAL_B},"backlog_files":${BACKLOG_F},"stuck_processing":${STUCK_COUNT},"oldest_processing_s":${OLDEST_PROC}},"processes":{"server":${P_SERVER},"worker":${P_WORKER},"dispatcher":${P_DISPATCH},"docker_pixel":${DOCKER_PIXEL}},"system":{"loadavg_1m":${LA1},"loadavg_5m":${LA5},"loadavg_15m":${LA15},"nproc":${NPROC},"mem_total_mb":${MEM_TOTAL},"mem_used_mb":${MEM_USED},"mem_free_mb":${MEM_FREE},"disk":{"total_kb":${DISK_TOTAL:-0},"used_kb":${DISK_USED:-0},"avail_kb":${DISK_AVAIL:-0},"use_pct":${DISK_PCT:-0}}}}
 JSON
 )"
 
@@ -207,6 +341,20 @@ if [ "$LOAD_HIGH" = "1" ]; then
 else
     check_alert "high-loadavg" "warn" 0 "loadavg_1m=${LA1} within nproc=${NPROC}"
 fi
+# redis configured-but-unreadable
+check_alert "redis-unreadable" "warn" "$REDIS_ALERT" "$REDIS_DETAIL"
+# pixel probe bad — only when an operator configured a real probe (bare 400 default does not alert)
+if [ "$PIXEL_CONFIGURED" = "1" ] && [ "$PIXEL_OK" != "true" ]; then
+    check_alert "pixel-probe-bad" "warn" 1 "pixel probe ${PIXEL_PROBE_URL} returned ${PIXEL_CODE} != expected ${PIXEL_EXPECT}"
+else
+    check_alert "pixel-probe-bad" "warn" 0 "pixel probe ok or default bare probe"
+fi
+# docker expected-container health (one dedup key per container; recovery fires when active=0)
+while IFS=$'\t' read -r tag dname dactive dsev ddetail; do
+    [ "$tag" = "ALERT" ] || continue
+    [ -n "$dname" ] || continue
+    check_alert "docker-container-${dname}" "$dsev" "$dactive" "container ${dname}: ${ddetail}"
+done < <(printf '%s\n' "$DOCKER_HELPER_OUT")
 
 # Persist new alert state as valid JSON.
 printf '{%s}\n' "${NEW_STATE%,}" > "$STATE_FILE"

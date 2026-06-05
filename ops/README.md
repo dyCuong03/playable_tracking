@@ -65,9 +65,116 @@ idempotent reconcile, so no duplicate daemons are ever created):
 @reboot      cd /path/to/playable_tracking && PIXEL_BASE=http://127.0.0.1:9000 bash ops/bin/ops-start.sh >> ops/logs/cron-reconcile.out 2>&1
 ```
 
-Notes: prod redis runs in a container (not on host `localhost`), so `redis-cli`
-depth shows `cli_missing` unless you publish its port; add the deploy user to the
-`docker` group so logcollector can read container logs.
+Notes: prod redis runs in a container (not on host `localhost`), so host
+`redis-cli` can't reach it — use the Docker-exec fallback below instead. Add the
+deploy user to the `docker` group so the monitor/logcollector can read containers.
+
+Copy `ops/.env.example` to set the Docker/Redis/pixel-probe vars in one place:
+
+```bash
+cp ops/.env.example ops/.env && $EDITOR ops/.env
+set -a; . ops/.env; set +a      # export everything
+bash ops/bin/ops-start.sh
+```
+
+## Production visibility (Docker, Redis, pixel)
+
+The pixel server is Docker-deployed, so proving `/health` responds is not enough.
+These env vars make `ops/` observe the real deployment. **`ops/` is observer-only —
+it runs `docker ps/inspect/logs` and `docker exec … redis-cli` (read commands)
+and NEVER restarts, recreates, or otherwise mutates application containers.**
+
+### Docker container monitoring
+
+Declare the containers you expect:
+
+```bash
+export OPS_DOCKER_CONTAINERS="pixel-nginx pixel-server pixel-redis pixel-worker"
+```
+
+The monitor then records each container's state/health/restarts/ports under
+`docker` in `ops/status/monitor-latest.json`, and the dashboard MONITOR pane
+renders a `== DOCKER HEALTH ==` table. With `OPS_DOCKER_CONTAINERS` set, a
+**missing / exited / restarting / healthcheck-unhealthy** container raises a
+deduped alert in `ops/status/alerts.ndjson` (one key per container, with
+recovery). Unset → the monitor only lists discovered containers and never fails
+health on a missing name. logcollector also collects
+`docker logs --since <window> --tail <N>` per declared container into
+`ops/logs/<date>/docker/<container>.log` and folds error/warn/fatal/exception
+lines into `errors-rollup.txt`.
+
+### Docker permission setup
+
+If Docker is installed but you see `permission_ok=false` / `permission_denied`
+(monitor) or `sources=0` with a `docker permission denied` warning
+(logcollector / dashboard):
+
+```bash
+sudo usermod -aG docker $USER
+# then log out and back in (or: newgrp docker)
+docker ps        # must succeed without sudo
+```
+
+### Redis via Docker exec
+
+Prod redis has no published host port, so set the container + queue key and the
+monitor reads depth through `docker exec`:
+
+```bash
+export OPS_REDIS_CONTAINER=pixel-redis
+export OPS_REDIS_QUEUE_KEY=pixel:events    # stream (XLEN) or list (LLEN) — both supported
+```
+
+Reported as `{"status":"ok","method":"docker_exec","container":...,"queue_key":...,"depth":N}`.
+Host `redis-cli` is tried first (`method:"host_cli"`). If neither is configured
+the section reads `not_configured` (no alert); if configured but unreadable it
+reads `error` and raises a `redis-unreadable` alert.
+
+### Pixel endpoint probe
+
+A bare `/p.gif` has no query params and returns **HTTP 400 by design** — the
+monitor labels this with a `note` so the dashboard never presents it as a real
+failure. Point the probe at a valid synthetic event instead:
+
+```bash
+export OPS_PIXEL_EXPECT_CODE=200
+export OPS_PIXEL_PROBE_PATH='/p.gif?e=interaction&sid=ops_healthcheck&env=ops&event_params=%7B%22name%22%3A%22ops_healthcheck%22%7D'
+# or an absolute URL (overrides the path):
+# export OPS_PIXEL_PROBE_URL='http://127.0.0.1:9000/p.gif?...'
+```
+
+A 200 needs `e=<start|interaction|store_trigger|end>`, `sid`, and the per-event
+fields inside the `event_params` JSON blob (URL-encoded `{"name":"ops_healthcheck"}`
+above). `env=ops` (≠ `production`) keeps the synthetic row in the `pixel_events_ver_2`
+table, not real production analytics, and `ops_healthcheck` marks it. Only a
+**configured** probe that misses `OPS_PIXEL_EXPECT_CODE` raises a `pixel-probe-bad`
+alert — the default bare 400 never alerts.
+
+### Where to point `PIXEL_BASE`
+
+`http://127.0.0.1:9000` is correct **only when `ops/` runs on the same VPS** as
+the server (deploy-prod's nginx publishes host port 9000). If `ops/` runs
+remotely, point it at the public IP / domain instead — and note Docker/Redis
+checks need to run **on the host**, since `docker exec` and `docker logs` are
+local to the Docker daemon:
+
+```bash
+export PIXEL_BASE=https://pixel.example.com    # remote HTTP probes only
+```
+
+### Capacity / plan
+
+Loadtesting is **off by default** and never auto-runs on deploy
+(`LOADTEST_ENABLED=0`, `CAPACITY_ENABLED=0`); the capacity pane explains the
+empty state instead of looking broken. `plan.sh` always produces a baseline —
+**no loadtest required** — and flags `measured_capacity_available=false` with a
+placeholder banner until a real stress run exists:
+
+```bash
+bash ops/bin/plan.sh        # writes reports/capacity-plan.md + status/capacity-plan.json
+```
+
+See **Manual capacity test** below to deliberately measure capacity.
 
 ## CI/CD
 
@@ -134,7 +241,11 @@ ops/
 | `PIXEL_BASE` | `http://127.0.0.1:9000` | all |
 | `MONITOR_INTERVAL` | `30` | monitor loop period (s) |
 | `HIGH_LATENCY_MS` / `QUEUE_BACKLOG_FILES` / `STUCK_PROCESSING_S` | `500` / `50` / `300` | monitor alert thresholds |
+| `OPS_DOCKER_CONTAINERS` | _(unset)_ | expected containers; set → missing/unhealthy alerts (monitor + logcollector) |
+| `OPS_REDIS_CONTAINER` / `OPS_REDIS_QUEUE_KEY` | _(unset)_ / `pixel:events` | redis depth via `docker exec` fallback (monitor) |
+| `OPS_PIXEL_PROBE_PATH` / `OPS_PIXEL_PROBE_URL` / `OPS_PIXEL_EXPECT_CODE` | bare `/p.gif` / _(unset)_ / `200` | configurable pixel probe (monitor) |
 | `LOGCOLLECT_INTERVAL` | `60` | logcollector loop period (s) |
+| `LOGCOLLECT_DOCKER_SINCE` / `LOGCOLLECT_DOCKER_TAIL` | `10m` / `500` | docker-log window per container (logcollector) |
 | `ERROR_SPIKE` | `20` | error-spike alert threshold |
 | `CAPACITY_INTERVAL` / `CAPACITY_POLL` | `86400` / `300` | capacity re-test cadence / health poll (s) |
 | `STAGES` / `STAGE_SECONDS` / `FAIL_RATE` / `FAIL_P95_MS` | `10..1600` / `15` / `0.01` / `500` | stress ramp + degrade thresholds |

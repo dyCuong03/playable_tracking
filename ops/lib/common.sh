@@ -42,6 +42,35 @@ heartbeat() {
 }
 
 # ===========================================================================
+# Docker visibility (READ-ONLY). ops observes containers; it NEVER restarts,
+# recreates, or otherwise mutates application containers. Only `docker ps`,
+# `docker inspect`, `docker logs`, and `docker exec ... redis-cli` (read cmds)
+# are ever used against app containers.
+# ===========================================================================
+
+# Classify docker access without mutating anything.
+# Echoes three space-separated tokens: <available> <permission_ok> <state>
+#   available     true|false  — docker CLI on PATH
+#   permission_ok true|false  — current user can talk to the daemon
+#   state         ok | no_cli | permission_denied | no_daemon
+docker_access() {
+    command -v docker >/dev/null 2>&1 || { echo "false false no_cli"; return; }
+    local out rc
+    out="$(docker ps 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then echo "true true ok"; return; fi
+    case "$out" in
+        *"permission denied"*|*"dial unix"*|*"Got permission denied"*)
+            echo "true false permission_denied" ;;
+        *) echo "true false no_daemon" ;;
+    esac
+}
+
+# Operator-declared expected app containers (space-separated). Empty => the
+# monitor runs in discovery-only mode (lists what is present, never fails
+# health on a missing name).
+ops_docker_expected() { printf '%s' "${OPS_DOCKER_CONTAINERS:-}"; }
+
+# ===========================================================================
 # Daemon reconciliation helpers
 # ---------------------------------------------------------------------------
 # A daemon is HEALTHY only when ALL hold:
