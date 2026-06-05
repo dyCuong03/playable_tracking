@@ -128,17 +128,18 @@ test("buildEvent end: parses event_params JSON with interact_count", () => {
 
 // ─── event.params: legacy-compat (separate query params for start) ────────────
 
-test("buildEvent start: legacy platform + campaign_raw params merged into event.params", () => {
+test("buildEvent start: legacy platform + campaign_raw network merged into event.params", () => {
     const event = buildEvent(makeReq({
         session_id: "sess-legacy-start",
         event_name: "start",
         event_time: "2026-06-04T10:00:00.000Z",
-        platform: "ios",
+        platform: "IOS",
         campaign_raw: JSON.stringify({ network: "goog", id: 9 }),
     }));
 
-    assert.equal(event.params.platform, "ios");
-    assert.deepEqual(event.params.campaign, { network: "goog", id: 9 });
+    assert.equal(event.params.platform, "IOS");
+    assert.equal(event.params.network, "goog");
+    assert.equal(event.params.campaign, undefined);
 });
 
 test("buildEvent start: event_params platform takes precedence over legacy platform param", () => {
