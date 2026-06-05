@@ -3,7 +3,11 @@
 # Shows alive / cmd_ok / heartbeat_fresh / healthy / reason as SEPARATE fields,
 # so a ghost pidfile (alive=true, cmd_ok=false) can never read as healthy.
 #
-# Usage: ops-status.sh [table|json]   (default: table)
+# Usage: ops-status.sh [table|json|gate]   (default: table)
+#   table  human-readable table (always exit 0)
+#   json   JSON array of per-daemon status objects (always exit 0)
+#   gate   print the table, then exit 1 if ANY daemon is unhealthy
+#          (used by CI / post-deploy to fail the pipeline on bad health)
 set -u
 . "$(dirname "$0")/../lib/common.sh"
 
@@ -16,12 +20,10 @@ collect() {
     done < <(ops_daemon_rows)
 }
 
-if [ "$fmt" = "json" ]; then
-    collect | python3 -c 'import sys,json; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()], indent=2))'
-else
+render_table() {
     printf '%-18s %-6s %-7s %-9s %-8s %-7s %s\n' DAEMON ALIVE CMD_OK HB_FRESH HEALTHY HB_AGE REASON
     printf '%-18s %-6s %-7s %-9s %-8s %-7s %s\n' '------' '-----' '------' '--------' '-------' '------' '------'
-    collect | python3 -c '
+    printf '%s\n' "$DATA" | python3 -c '
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -34,4 +36,26 @@ for line in sys.stdin:
         d["name"], b(d["alive"]), b(d["cmd_ok"]), b(d["heartbeat_fresh"]),
         b(d["healthy"]), (str(age)+"s" if age >= 0 else "n/a"), d["reason"]))
 '
-fi
+}
+
+DATA="$(collect)"
+
+case "$fmt" in
+json)
+    printf '%s\n' "$DATA" | python3 -c 'import sys,json; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()], indent=2))'
+    ;;
+gate)
+    render_table
+    printf '%s\n' "$DATA" | python3 -c '
+import sys, json
+bad = [json.loads(l)["name"] for l in sys.stdin if l.strip() and not json.loads(l)["healthy"]]
+if bad:
+    print("UNHEALTHY: " + ", ".join(bad))
+    sys.exit(1)
+print("all daemons healthy")
+'
+    ;;
+*)
+    render_table
+    ;;
+esac

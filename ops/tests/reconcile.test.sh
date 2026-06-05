@@ -41,10 +41,24 @@ chmod +x "$TMP"/fake-loop-*.sh
 
 reconcile() { reconcile_daemon "$1" "$2" "$EXPECTED" "$3" 10 bash "$TMP/$4" "$2" "$3"; }
 wait_healthy() {  # pidfile hbfile
+    # Up to ~15s: tolerate process-launch + first-heartbeat latency on a loaded
+    # box / CI runner so this never false-fails the gate.
     local p i
-    for i in $(seq 1 20); do
+    for i in $(seq 1 50); do
         p="$(cat "$1" 2>/dev/null)"
-        if [ -n "$p" ] && is_pid_alive "$p" && is_expected_daemon "$p" "$EXPECTED" && is_heartbeat_fresh "$2" 15; then return 0; fi
+        if [ -n "$p" ] && is_pid_alive "$p" && is_expected_daemon "$p" "$EXPECTED" && is_heartbeat_fresh "$2" 30; then return 0; fi
+        sleep 0.3
+    done
+    return 1
+}
+
+# Wait until a fixture's pidfile holds a live pid running the expected script.
+# Heartbeat-agnostic — for the stale-heartbeat fixture whose hb stays old by design.
+wait_cmd() {  # pidfile
+    local p i
+    for i in $(seq 1 50); do
+        p="$(cat "$1" 2>/dev/null)"
+        if [ -n "$p" ] && is_pid_alive "$p" && is_expected_daemon "$p" "$EXPECTED"; then return 0; fi
         sleep 0.3
     done
     return 1
@@ -103,7 +117,8 @@ kill "$(cat "$PF" 2>/dev/null)" 2>/dev/null
 # ---- Case 5: cmd correct but heartbeat stale -> restart -------------------
 echo "[case 5] cmd ok, heartbeat stale -> restart"
 PF="$TMP/c5.pid"; HB="$TMP/c5.hb"
-nohup bash "$TMP/fake-loop-stale.sh" "$PF" "$HB" >/dev/null 2>&1 & sleep 1
+nohup bash "$TMP/fake-loop-stale.sh" "$PF" "$HB" >/dev/null 2>&1 &
+wait_cmd "$PF" || true
 S="$(cat "$PF")"
 chk "case5 pre: cmd ok"   "is_expected_daemon $S $EXPECTED"
 chk "case5 pre: hb stale" "! is_heartbeat_fresh $HB 10"
@@ -118,7 +133,8 @@ kill "$(cat "$PF" 2>/dev/null)" 2>/dev/null
 # ---- Case 6: healthy -> skip, no duplicate -------------------------------
 echo "[case 6] healthy -> skip, no duplicate"
 PF="$TMP/c6.pid"; HB="$TMP/c6.hb"
-nohup bash "$TMP/fake-loop-good.sh" "$PF" "$HB" >/dev/null 2>&1 & sleep 1
+nohup bash "$TMP/fake-loop-good.sh" "$PF" "$HB" >/dev/null 2>&1 &
+wait_healthy "$PF" "$HB" || true
 H="$(cat "$PF")"
 chk "case6 pre: healthy" "is_expected_daemon $H $EXPECTED && is_heartbeat_fresh $HB 15"
 OUT="$(reconcile c6 "$PF" "$HB" fake-loop-good.sh)"

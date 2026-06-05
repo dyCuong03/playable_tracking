@@ -20,6 +20,9 @@ ROLE="loadtester"
 CAPACITY_INTERVAL="${CAPACITY_INTERVAL:-86400}"   # min seconds between full runs (default daily)
 CAPACITY_POLL="${CAPACITY_POLL:-300}"             # seconds between health checks
 CAPACITY_MAX_CYCLES="${CAPACITY_MAX_CYCLES:-0}"   # stop after N cycles (0 = run forever; for tests/cron)
+CAPACITY_ENABLED="${CAPACITY_ENABLED:-0}"         # gate the actual stress run; the daemon still
+                                                  # heartbeats + polls health when 0, but never
+                                                  # loadtests until an operator opts in with 1.
 LAST_RUN_FILE="$STATUS_DIR/capacity-last-run"
 HISTORY="$REPORTS_DIR/capacity-history.ndjson"
 PID_FILE="$STATUS_DIR/capacity-loop.pid"
@@ -60,11 +63,18 @@ while true; do
         NOW="$(date -u +%s)"
         LAST="$(last_run_epoch)"
         AGE=$(( NOW - LAST ))
-        if [ "$AGE" -lt "$CAPACITY_INTERVAL" ]; then
+        if [ "$CAPACITY_ENABLED" != "1" ]; then
+            # Daemon stays healthy (heartbeat above) but never auto-loadtests.
+            # This is what keeps a deploy from triggering a stress run.
+            jlog "info" "$ROLE" "capacity testing disabled - set CAPACITY_ENABLED=1 to schedule runs" "{\"enabled\":0}"
+        elif [ "$AGE" -lt "$CAPACITY_INTERVAL" ]; then
             jlog "info" "$ROLE" "capacity test not due yet" "{\"age_s\":$AGE,\"interval_s\":$CAPACITY_INTERVAL}"
         else
             jlog "info" "$ROLE" "capacity test due - running stress" "{\"age_s\":$AGE}"
-            if bash "$OPS_DIR/bin/stress.sh"; then
+            # Deliberate scheduled runner: flip the stress.sh master switch on.
+            # MAX_RPS / MAX_CONCURRENCY ceilings and the production guard
+            # (LOADTEST_ENV / ALLOW_PROD_LOADTEST) are inherited and still apply.
+            if LOADTEST_ENABLED=1 bash "$OPS_DIR/bin/stress.sh"; then
                 echo "$NOW" > "$LAST_RUN_FILE"
                 if [ -f "$VERDICT_FILE" ]; then
                     cat "$VERDICT_FILE" >> "$HISTORY"
