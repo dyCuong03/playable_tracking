@@ -82,8 +82,10 @@ const resolveEventTime = (query) => {
     return new Date().toISOString();
 };
 
-// For "start" events: if event_params is missing platform or campaign, pull from legacy
-// query params (plf/platform and camp/campaign_raw) so old clients keep working.
+// For "start" events: if event_params is missing platform or network, pull from legacy
+// query params (plf/platform and camp/campaign_raw) so old clients keep working. The
+// start event_params contract is flat { network, platform } — the network is lifted out
+// of any legacy campaign payload rather than nested under a campaign object.
 const mergeLegacyStartParams = (eventParams, query) => {
     const merged = { ...eventParams };
 
@@ -94,12 +96,12 @@ const mergeLegacyStartParams = (eventParams, query) => {
         }
     }
 
-    if (!merged.campaign) {
+    if (!merged.network) {
         const legacyCampaign = query.campaign_raw || query.camp || "";
         if (legacyCampaign) {
             const parsed = parseEventParams(legacyCampaign);
-            if (Object.keys(parsed).length > 0) {
-                merged.campaign = parsed;
+            if (parsed && parsed.network) {
+                merged.network = parsed.network;
             }
         }
     }

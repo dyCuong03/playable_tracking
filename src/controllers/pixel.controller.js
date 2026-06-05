@@ -31,14 +31,22 @@ const validateEvent = (event) => {
     }
 
     switch (event.event) {
-    case "start":
+    case "start": {
+        const VALID_PLATFORMS = new Set(["Windows", "Android", "IOS"]);
         if (!params.platform) {
             errors.push({ field: "event_params.platform", issue: "required for start event" });
+        } else if (!VALID_PLATFORMS.has(params.platform)) {
+            errors.push({
+                field: "event_params.platform",
+                issue: "must be one of: Windows, Android, IOS",
+                received: params.platform,
+            });
         }
-        if (!params.campaign || typeof params.campaign !== "object") {
-            errors.push({ field: "event_params.campaign", issue: "required object for start event" });
+        if (!params.network) {
+            errors.push({ field: "event_params.network", issue: "required for start event" });
         }
         break;
+    }
     case "interaction":
     case "store_trigger":
         if (!params.name) {

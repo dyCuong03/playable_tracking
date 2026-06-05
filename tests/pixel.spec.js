@@ -65,12 +65,42 @@ test("GET /p.gif: start event returns 200 image/gif immediately", async () => {
             session_id: "sess-start-1",
             event_name: "start",
             event_time: "2026-06-04T10:00:00.000Z",
-            event_params: JSON.stringify({ platform: "android", campaign: {} }),
+            event_params: JSON.stringify({ network: "meta", platform: "Android" }),
         })
         .expect(200);
 
     assert.equal(response.headers["content-type"], "image/gif");
     assert.ok(Buffer.isBuffer(response.body) && response.body.length > 0);
+});
+
+test("GET /p.gif: start with invalid platform is rejected (400) and not queued", async () => {
+    await request(app)
+        .get("/p.gif")
+        .query({
+            session_id: "sess-bad-platform",
+            event_name: "start",
+            event_time: "2026-06-04T10:00:00.000Z",
+            // network name leaking into platform — must fail the Windows/Android/IOS enum
+            event_params: JSON.stringify({ network: "mintegral", platform: "mintegral" }),
+        })
+        .expect(400);
+
+    await waitForQueueData();
+    const rows = await readAllQueuedRows();
+    assert.equal(rows.find((r) => r.session_id === "sess-bad-platform"), undefined,
+        "invalid-platform start event must not be persisted");
+});
+
+test("GET /p.gif: start missing network is rejected (400)", async () => {
+    await request(app)
+        .get("/p.gif")
+        .query({
+            session_id: "sess-no-network",
+            event_name: "start",
+            event_time: "2026-06-04T10:00:00.000Z",
+            event_params: JSON.stringify({ platform: "Android" }),
+        })
+        .expect(400);
 });
 
 test("GET /p.gif: interaction event returns 200 image/gif immediately", async () => {
@@ -127,7 +157,7 @@ test("GET /p.gif persists event to durable queue before responding", async () =>
             session_id: "sess-queue-1",
             event_name: "start",
             event_time: "2026-06-04T10:00:00.000Z",
-            event_params: JSON.stringify({ platform: "ios", campaign: {} }),
+            event_params: JSON.stringify({ network: "meta", platform: "IOS" }),
         })
         .expect(200);
 
@@ -155,7 +185,7 @@ test("queued row preserves client-provided event_time (not server time)", async 
             session_id: "sess-time-1",
             event_name: "start",
             event_time: clientTime,
-            event_params: JSON.stringify({ platform: "android", campaign: {} }),
+            event_params: JSON.stringify({ network: "meta", platform: "Android" }),
         })
         .expect(200);
 
@@ -197,14 +227,14 @@ test("queued row has received_at added by server", async () => {
 
 // ─── Row content: event_params structure ─────────────────────────────────────
 
-test("queued row for start event has event_params with platform and campaign", async () => {
+test("queued row for start event has event_params with network and platform", async () => {
     await request(app)
         .get("/p.gif")
         .query({
             session_id: "sess-start-params",
             event_name: "start",
             event_time: "2026-06-04T10:00:00.000Z",
-            event_params: JSON.stringify({ platform: "android", campaign: { network: "meta", id: 7 } }),
+            event_params: JSON.stringify({ network: "meta", platform: "Android" }),
         })
         .expect(200);
 
@@ -214,18 +244,19 @@ test("queued row for start event has event_params with platform and campaign", a
 
     assert.ok(row, "Row for sess-start-params not found");
     assert.equal(typeof row.event_params, "object");
-    assert.equal(row.event_params.platform, "android");
-    assert.deepEqual(row.event_params.campaign, { network: "meta", id: 7 });
+    assert.equal(row.event_params.network, "meta");
+    assert.equal(row.event_params.platform, "Android");
+    assert.equal(row.event_params.campaign, undefined);
 });
 
-test("queued row for start event: legacy platform + campaign_raw params work too", async () => {
+test("queued row for start event: legacy platform + campaign_raw network work too", async () => {
     await request(app)
         .get("/p.gif")
         .query({
             session_id: "sess-legacy-start",
             event_name: "start",
             event_time: "2026-06-04T10:00:00.000Z",
-            platform: "ios",
+            platform: "IOS",
             campaign_raw: JSON.stringify({ network: "goog" }),
         })
         .expect(200);
@@ -235,8 +266,9 @@ test("queued row for start event: legacy platform + campaign_raw params work too
     const row = rows.find((r) => r.session_id === "sess-legacy-start");
 
     assert.ok(row, "Row for sess-legacy-start not found");
-    assert.equal(row.event_params.platform, "ios");
-    assert.deepEqual(row.event_params.campaign, { network: "goog" });
+    assert.equal(row.event_params.platform, "IOS");
+    assert.equal(row.event_params.network, "goog");
+    assert.equal(row.event_params.campaign, undefined);
 });
 
 test("queued row for end event has event_params with interact_count", async () => {
