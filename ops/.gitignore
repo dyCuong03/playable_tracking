@@ -1,0 +1,9 @@
+# Only the ops code is tracked (bin/, lib/, tests/, README.md).
+# Everything below is runtime / generated state produced by the daemons.
+logs/
+status/
+reports/
+*.pid
+*.heartbeat
+*.out
+*.nohup.out
