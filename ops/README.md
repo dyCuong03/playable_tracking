@@ -355,20 +355,23 @@ run normally with or without it.
 
 **nginx request log export** (`OPS_BQ_NGINX_TABLE`, default `nginx_requests`)
 
-Tails the nginx access log inside the nginx container (via `docker exec cat
-<path>`) on every `OPS_BQ_EXPORT_INTERVAL_SECONDS` cycle. Each line is parsed
-into structured fields (`timestamp`, `method`, `uri`, `status`, `bytes_sent`,
-`request_time`, `request_id`, `ip_hash`, `query_params`), cursor-tracked so
-lines are never re-exported, and batch-inserted into BigQuery. Combined with the
-custom `log_format` described at the end of this section, you get
-`request_time` (latency) and a correlation `request_id` per row.
+Reads the nginx access log on every `OPS_BQ_EXPORT_INTERVAL_SECONDS` cycle via
+either a direct file path (`OPS_NGINX_ACCESS_LOG_PATH`) or `docker logs` from a
+named container (`OPS_NGINX_CONTAINER`). Each line is auto-detected as JSON
+(`pixel_json` format) or `combined` plain-text, then parsed into structured
+NDJSON fields: `ts`, `source`, `container`, `remote_ip_hash`, `method`, `path`,
+`query`, `status`, `request_time_ms`, `upstream_response_time_ms`,
+`body_bytes_sent`, `user_agent_hash`, `request_id`, and `raw_format`. A
+byte-offset / docker-since cursor ensures lines are never re-exported. Rows are
+staged under `ops/logs/<date>/bq/nginx_requests.ndjson` before upload.
 
 **Redis metrics export** (`OPS_BQ_REDIS_TABLE`, default `redis_metrics`)
 
-On each cycle, reads the Redis stream depth (`XLEN pixel:events`) via
-`docker exec` (same path the monitor uses) and writes one row per sample:
-`{timestamp, queue_key, depth, worker_count}`. Use this to correlate queue
-backlog spikes with error-rate spikes in the nginx table.
+On each cycle, runs `redis-cli INFO` (host or `docker exec`) and writes one row
+per sample containing memory, client, and throughput counters from Redis INFO
+output, plus the `queue_depth` from `XLEN`/`LLEN` on `OPS_REDIS_QUEUE_KEY`.
+Use this to correlate queue backlog spikes with error-rate spikes in the nginx
+table. Rows are staged under `ops/logs/<date>/bq/redis_metrics.ndjson`.
 
 ### BigQuery setup
 
@@ -381,43 +384,66 @@ CREATE SCHEMA `<OPS_BQ_PROJECT_ID>.<OPS_BQ_DATASET>`
 
 #### 2. Create partitioned tables
 
-**nginx_requests** (partitioned by event date, clustered for common WHERE clauses):
+**nginx_requests** (partitioned by event date, clustered by path / status / source):
 
 ```sql
-CREATE TABLE `<project>.<dataset>.nginx_requests`
+CREATE TABLE IF NOT EXISTS `<project>.<dataset>.nginx_requests`
 (
-  event_date     DATE         NOT NULL OPTIONS (description='Partition column'),
-  timestamp      TIMESTAMP    NOT NULL,
-  method         STRING,
-  uri            STRING,
-  status         INT64,
-  bytes_sent     INT64,
-  request_time   FLOAT64,     -- seconds; requires custom log_format (see below)
-  request_id     STRING,      -- requires $request_id in log_format
-  ip_hash        STRING,      -- SHA-256 of client IP (OPS_LOG_HASH_IP=1)
-  query_params   JSON         -- filtered by OPS_LOG_QUERY_ALLOWLIST
+  event_date                DATE        NOT NULL,
+  ts                        TIMESTAMP   NOT NULL,
+  source                    STRING      NOT NULL,   -- "file" or "docker_exec"
+  container                 STRING      NOT NULL,
+  remote_ip_hash            STRING,                 -- SHA-256 of client IP (OPS_LOG_HASH_IP=1)
+  method                    STRING,
+  path                      STRING,                 -- request path without query string
+  query                     JSON,                   -- filtered by OPS_LOG_QUERY_ALLOWLIST
+  status                    INT64,
+  request_time_ms           FLOAT64,                -- nginx $request_time × 1000; requires pixel_json log_format
+  upstream_response_time_ms FLOAT64,                -- nginx $upstream_response_time × 1000
+  body_bytes_sent           INT64,
+  referer                   STRING,
+  user_agent_hash           STRING,                 -- SHA-256 of User-Agent
+  request_id                STRING,                 -- nginx $request_id; requires pixel_json log_format
+  raw_format                STRING,                 -- "json" or "combined"
+  insert_id                 STRING      NOT NULL    -- dedup key (SHA-256 of ts+container+request_id)
 )
 PARTITION BY event_date
-CLUSTER BY status, uri
+CLUSTER BY path, status, source
 OPTIONS (
-  require_partition_filter = false,
+  require_partition_filter = FALSE,
   partition_expiration_days = 90
 );
 ```
 
-**redis_metrics**:
+**redis_metrics** (partitioned by event date, clustered by container / queue_key):
 
 ```sql
-CREATE TABLE `<project>.<dataset>.redis_metrics`
+CREATE TABLE IF NOT EXISTS `<project>.<dataset>.redis_metrics`
 (
-  event_date    DATE      NOT NULL OPTIONS (description='Partition column'),
-  timestamp     TIMESTAMP NOT NULL,
-  queue_key     STRING,
-  depth         INT64,
-  worker_count  INT64
+  event_date                    DATE        NOT NULL,
+  ts                            TIMESTAMP   NOT NULL,
+  source                        STRING      NOT NULL,   -- "host_cli" or "docker_exec"
+  container                     STRING,
+  used_memory                   INT64,
+  used_memory_human             STRING,
+  connected_clients             INT64,
+  blocked_clients               INT64,
+  instantaneous_ops_per_sec     INT64,
+  total_commands_processed      INT64,
+  keyspace_hits                 INT64,
+  keyspace_misses               INT64,
+  role                          STRING,
+  uptime_in_seconds             INT64,
+  queue_key                     STRING      NOT NULL,
+  queue_depth                   INT64,                  -- null when OPS_REDIS_QUEUE_KEY not set
+  insert_id                     STRING      NOT NULL
 )
 PARTITION BY event_date
-OPTIONS (partition_expiration_days = 90);
+CLUSTER BY container, queue_key
+OPTIONS (
+  require_partition_filter = FALSE,
+  partition_expiration_days = 90
+);
 ```
 
 Set `OPS_BQ_CREATE_TABLES=1` to let the exporter create these tables
@@ -510,7 +536,7 @@ All four privacy vars default to the safest setting:
 |-----|---------|--------|
 | `OPS_LOG_HASH_IP` | `1` | Replace client IP with `SHA-256(<ip>)` before export |
 | `OPS_LOG_INCLUDE_QUERY` | `1` | Include query-string (needed for campaign/platform columns) |
-| `OPS_LOG_QUERY_ALLOWLIST` | `"event game source campaign platform"` | Only these param names are kept; all others are dropped |
+| `OPS_LOG_QUERY_ALLOWLIST` | `"e pid sid playableId platform camp campaign_raw env"` | Only these param names are kept; all others are dropped |
 | `OPS_LOG_DROP_HEADERS` | `1` | Strip `User-Agent`, `Referer`, `Cookie` before upload |
 
 To maximise privacy (at the cost of less analytical detail):
@@ -534,75 +560,90 @@ OPS_LOG_DROP_HEADERS=0
 ### Example BigQuery queries
 
 ```sql
--- Requests per day and hour
+-- Request count by day and hour (last 7 days)
 SELECT
   event_date,
-  EXTRACT(HOUR FROM timestamp) AS hour,
-  COUNT(*)                      AS requests
+  EXTRACT(HOUR FROM ts) AS hour,
+  COUNT(*)              AS requests
 FROM `<project>.<dataset>.nginx_requests`
-WHERE event_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND CURRENT_DATE()
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
 GROUP BY 1, 2
 ORDER BY 1, 2;
 
--- Error rate by HTTP status (last 24 h)
+-- HTTP status / error rate (last 24 h)
 SELECT
   status,
   COUNT(*) AS n,
   ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS pct
 FROM `<project>.<dataset>.nginx_requests`
-WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
 GROUP BY status
 ORDER BY n DESC;
+
+-- p.gif latency p50 / p95 / p99 (last 7 days, by day)
+SELECT
+  event_date,
+  APPROX_QUANTILES(request_time_ms, 100)[OFFSET(50)] AS p50_ms,
+  APPROX_QUANTILES(request_time_ms, 100)[OFFSET(95)] AS p95_ms,
+  APPROX_QUANTILES(request_time_ms, 100)[OFFSET(99)] AS p99_ms,
+  COUNT(*)                                            AS requests
+FROM `<project>.<dataset>.nginx_requests`
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+  AND path = '/p.gif'
+  AND request_time_ms IS NOT NULL
+GROUP BY 1
+ORDER BY 1 DESC;
 
 -- p.gif pixel-event volume by day
 SELECT
   event_date,
   COUNT(*) AS pixel_hits
 FROM `<project>.<dataset>.nginx_requests`
-WHERE uri LIKE '/p.gif%'
+WHERE path LIKE '/p.gif%'
 GROUP BY 1
 ORDER BY 1 DESC
 LIMIT 30;
 
 -- Top campaign and platform (last 7 days)
 SELECT
-  JSON_VALUE(query_params, '$.campaign') AS campaign,
-  JSON_VALUE(query_params, '$.platform') AS platform,
+  JSON_VALUE(query, '$.campaign') AS campaign,
+  JSON_VALUE(query, '$.platform') AS platform,
   COUNT(*) AS hits
 FROM `<project>.<dataset>.nginx_requests`
 WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
-  AND uri LIKE '/p.gif%'
+  AND path LIKE '/p.gif%'
 GROUP BY 1, 2
 ORDER BY 3 DESC
 LIMIT 20;
 
--- Redis queue depth over time (last 48 h)
+-- Redis queue depth over time (last 48 h, per minute)
 SELECT
-  TIMESTAMP_TRUNC(timestamp, MINUTE) AS minute,
-  AVG(depth)                          AS avg_depth,
-  MAX(depth)                          AS max_depth
+  TIMESTAMP_TRUNC(ts, MINUTE) AS minute,
+  AVG(queue_depth)            AS avg_depth,
+  MAX(queue_depth)            AS max_depth
 FROM `<project>.<dataset>.redis_metrics`
-WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+  AND queue_depth IS NOT NULL
 GROUP BY 1
 ORDER BY 1;
 
--- 5xx rate vs Redis backlog correlation (15-minute buckets)
+-- 5xx error rate vs Redis backlog correlation (15-minute buckets)
 WITH
   nginx AS (
     SELECT
-      TIMESTAMP_TRUNC(timestamp, MINUTE) AS t,
-      COUNTIF(status >= 500)             AS errors_5xx,
-      COUNT(*)                           AS total
+      TIMESTAMP_TRUNC(ts, MINUTE) AS t,
+      COUNTIF(status >= 500)      AS errors_5xx,
+      COUNT(*)                    AS total
     FROM `<project>.<dataset>.nginx_requests`
-    WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+    WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
     GROUP BY 1
   ),
   redis AS (
     SELECT
-      TIMESTAMP_TRUNC(timestamp, MINUTE) AS t,
-      AVG(depth)                          AS avg_depth
+      TIMESTAMP_TRUNC(ts, MINUTE) AS t,
+      AVG(queue_depth)            AS avg_depth
     FROM `<project>.<dataset>.redis_metrics`
-    WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+    WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
     GROUP BY 1
   )
 SELECT
@@ -616,33 +657,223 @@ JOIN redis r USING (t)
 ORDER BY t;
 ```
 
-### Custom nginx `log_format` for `request_time` and `request_id`
+### `pixel_json` nginx log format and redeploy requirement
 
-By default, nginx's `combined` format does not include `$request_time` (latency
-in seconds) or a per-request correlation ID. Add this `log_format` block to your
-nginx config before the `server {}` block:
+`scripts/nginx-pixel.conf.template` already contains the `pixel_json` log
+format needed for latency and correlation-ID columns. It becomes active after
+running `./scripts/deploy-prod.sh` (which recreates the nginx container). A
+rolling restart of app-only containers does **not** reload nginx's config.
 
 ```nginx
-log_format ops_json escape=json
-  '{'
-    '"time":"$time_iso8601",'
-    '"method":"$request_method",'
-    '"uri":"$request_uri",'
-    '"status":$status,'
-    '"bytes":$body_bytes_sent,'
-    '"request_time":$request_time,'
-    '"request_id":"$request_id",'
-    '"remote_addr":"$remote_addr"'
-  '}';
+log_format pixel_json escape=json
+    '{"ts":"$time_iso8601",'
+     '"remote_addr":"$remote_addr",'
+     '"request_id":"$request_id",'
+     '"method":"$request_method",'
+     '"uri":"$uri",'
+     '"args":"$args",'
+     '"status":$status,'
+     '"body_bytes_sent":$body_bytes_sent,'
+     '"request_time":$request_time,'
+     '"upstream_response_time":"$upstream_response_time",'
+     '"upstream_status":"$upstream_status",'
+     '"http_referer":"$http_referer",'
+     '"http_user_agent":"$http_user_agent",'
+     '"host":"$host"}';
 
-access_log /var/log/nginx/access.log ops_json;
+access_log /var/log/nginx/access.log pixel_json;
+error_log  /var/log/nginx/error.log  warn;
 ```
 
-Then set `OPS_NGINX_ACCESS_LOG_PATH=/var/log/nginx/access.log` (or whatever path
-you mount) and `OPS_BQ_EXPORT_ENABLED=1`. The exporter detects the JSON format
-automatically and maps `request_time` → `request_time` and `request_id` →
-`request_id` in the BigQuery row. Without this format the fields are empty but
-all other columns still populate normally.
+> **Note:** the official nginx Docker image symlinks
+> `/var/log/nginx/access.log → /dev/stdout`, so JSON lines appear in
+> `docker logs` with no extra bind-mount needed.
+
+The exporter auto-detects JSON lines (first character `{`) and maps:
+`request_time` (seconds) → `request_time_ms` (integer milliseconds),
+`upstream_response_time` → `upstream_response_time_ms`, and sets
+`raw_format = "json"`. Without `pixel_json` the exporter still works with the
+`combined` fallback parser, but `request_time_ms`, `upstream_response_time_ms`,
+`request_id`, and `raw_format` will be `null`.
+
+## Daily nginx/Redis logs and BigQuery export
+
+The ops stack writes two types of files under `ops/logs/<UTC-date>/` on every
+exporter run:
+
+| Path | Contents | Purpose |
+|------|----------|---------|
+| `ops/logs/<date>/docker/<container>.log` | Raw `docker logs` output (nginx access lines, app stderr, container stdout) | Human-readable daily archive; rolled by logcollector |
+| `ops/logs/<date>/bq/nginx_requests.ndjson` | Parsed NDJSON — one row per HTTP request | Staging file before BigQuery upload |
+| `ops/logs/<date>/bq/redis_metrics.ndjson` | Parsed NDJSON — one Redis INFO row per poll interval | Staging file before BigQuery upload |
+| `ops/logs/<date>/bq/nginx_requests.status.json` | Status file (created when the nginx source is unavailable) | Explains why `nginx_requests.ndjson` is absent |
+| `ops/logs/<date>/bq/redis_metrics.status.json` | Status file (created when Redis is not configured) | Explains why `redis_metrics.ndjson` is absent |
+
+The **docker/** files are raw text, useful for grep / incident investigation.
+The **bq/** NDJSON files are structured and ready for analytics — fields are
+privacy-filtered, IPs are hashed, and timestamps are normalised to UTC.
+
+### Why dev / WSL shows only placeholder or status files
+
+On a dev machine or WSL2 where the Docker daemon is unavailable:
+
+- `docker/` contains only `_docker-unavailable.log` (the logcollector recorded
+  why container logs were skipped).
+- `bq/nginx_requests.status.json` is written instead of `.ndjson` — the nginx
+  exporter could not reach any source (`docker_unavailable` or
+  `no_nginx_source`). The file records `source_status` and `reason` so you know
+  exactly what was missing.
+- `bq/redis_metrics.ndjson` is absent or contains only `not_configured` rows
+  when `OPS_REDIS_CONTAINER` is not set. Such rows are logged at
+  `rows_staged = 0` and are **not** counted toward upload totals.
+- `ops/status/bq-export-latest.json` shows `"enabled": false` (default) or,
+  if enabled, `"nginx": {"source_status": "docker_unavailable"}` /
+  `"redis": {"source_status": "not_configured"}`.
+
+This is expected. The three core daemons (monitor, logcollector, capacity)
+run normally; only the BQ exporter reports incomplete data.
+
+### How to check on VPS
+
+```bash
+# Verify today's dated directories exist
+ls -la ops/logs/$(date -u +%F)/
+
+# Check for real docker logs (not just _docker-unavailable.log)
+ls -la ops/logs/$(date -u +%F)/docker/
+
+# Check BQ staging files — expect *.ndjson, not just *.status.json
+ls -la ops/logs/$(date -u +%F)/bq/
+
+# Inspect the latest exporter run summary
+cat ops/status/bq-export-latest.json
+# Healthy output: "nginx": {"source_status": "ok"}, "redis": {"source_status": "ok"}
+
+# Check ops daemon health (shows bq_export block when ENABLED=1)
+bash ops/bin/ops-status.sh
+bash ops/bin/ops-status.sh json
+```
+
+### Config required for real data
+
+The exporter writes placeholder / status-only files unless these are set in
+`ops/.env` (see `ops/.env.example` for full reference):
+
+```bash
+# nginx source — set ONE of these:
+OPS_NGINX_CONTAINER=playable_tracking-nginx-1        # Docker container (docker logs)
+# or:
+OPS_NGINX_ACCESS_LOG_PATH=/var/log/nginx/access.log  # direct file path
+
+# Redis
+OPS_REDIS_CONTAINER=playable_tracking-redis-1
+OPS_REDIS_QUEUE_KEY=pixel:events
+
+# BigQuery upload (collect works without these; upload requires all three)
+OPS_BQ_EXPORT_ENABLED=1
+OPS_BQ_PROJECT_ID=my-gcp-project
+OPS_BQ_DATASET=pixel_ops_logs
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/app/credentials/pixel-ops-sa.json
+```
+
+See **BigQuery log export** above for IAM setup, table creation, and the full
+list of optional vars (`OPS_BQ_NGINX_TABLE`, `OPS_BQ_REDIS_TABLE`,
+`OPS_BQ_EXPORT_INTERVAL_SECONDS`, `OPS_BQ_CREATE_TABLES`, etc.).
+
+### Enabling BQ export on the VPS
+
+After completing BigQuery setup (IAM + tables), add to `ops/.env` and restart:
+
+```bash
+set -a; . ops/.env; set +a
+bash ops/bin/ops-start.sh      # starts bq-exporter-loop daemon
+bash ops/bin/ops-status.sh     # verify bq_export block appears + status ok
+```
+
+`ops-start.sh` is idempotent — safe to re-run at any time.
+
+### nginx `pixel_json` log format — activate and redeploy
+
+The `pixel_json` log format is already embedded in
+`scripts/nginx-pixel.conf.template`. It provides `request_time_ms`,
+`upstream_response_time_ms`, and `request_id` columns in BigQuery.
+
+To activate it, **redeploy nginx** (a rolling app-container restart is not
+enough — nginx config is baked into the container):
+
+```bash
+./scripts/deploy-prod.sh
+```
+
+Without `pixel_json`, the exporter still works using the `combined` fallback
+parser, but `request_time_ms`, `upstream_response_time_ms`, `request_id`, and
+`raw_format` will be `null` in every row.
+
+For the full format definition, see **`pixel_json` nginx log format and redeploy
+requirement** in the BigQuery log export section above.
+
+### Privacy controls
+
+All privacy vars default to the safest setting. Quick reference:
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `OPS_LOG_HASH_IP` | `1` | Replace client IP with SHA-256 hash before export |
+| `OPS_LOG_INCLUDE_QUERY` | `1` | Include query string (needed for campaign / platform analysis) |
+| `OPS_LOG_QUERY_ALLOWLIST` | `"e pid sid playableId platform camp campaign_raw env"` | Only these param names kept; all others dropped |
+| `OPS_LOG_DROP_HEADERS` | `1` | Strip `User-Agent`, `Referer`, `Cookie` before upload |
+
+### Example BigQuery queries
+
+Replace `<project>.<dataset>` with your values (e.g. `my-project.pixel_ops_logs`).
+
+```sql
+-- Request count by hour (last 7 days)
+SELECT
+  event_date,
+  EXTRACT(HOUR FROM ts) AS hour,
+  COUNT(*)              AS requests
+FROM `<project>.<dataset>.nginx_requests`
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+-- HTTP status / error rate (last 24 h)
+SELECT
+  status,
+  COUNT(*) AS n,
+  ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM `<project>.<dataset>.nginx_requests`
+WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+GROUP BY status
+ORDER BY n DESC;
+
+-- p.gif request latency p50 / p95 / p99 (last 7 days, by day)
+-- Requires pixel_json log format to be active (request_time_ms must not be null)
+SELECT
+  event_date,
+  APPROX_QUANTILES(request_time_ms, 100)[OFFSET(50)] AS p50_ms,
+  APPROX_QUANTILES(request_time_ms, 100)[OFFSET(95)] AS p95_ms,
+  APPROX_QUANTILES(request_time_ms, 100)[OFFSET(99)] AS p99_ms,
+  COUNT(*)                                            AS requests
+FROM `<project>.<dataset>.nginx_requests`
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+  AND path = '/p.gif'
+  AND request_time_ms IS NOT NULL
+GROUP BY 1
+ORDER BY 1 DESC;
+
+-- Redis queue depth over time (last 48 h, per minute)
+SELECT
+  TIMESTAMP_TRUNC(ts, MINUTE) AS minute,
+  AVG(queue_depth)            AS avg_depth,
+  MAX(queue_depth)            AS max_depth
+FROM `<project>.<dataset>.redis_metrics`
+WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+  AND queue_depth IS NOT NULL
+GROUP BY 1
+ORDER BY 1;
+```
 
 ## Notes
 

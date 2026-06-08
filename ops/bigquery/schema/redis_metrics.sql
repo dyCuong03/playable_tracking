@@ -33,32 +33,44 @@ CREATE TABLE IF NOT EXISTS `%%PROJECT%%.%%DATASET%%.%%TABLE%%`
     -- Exporter operational status: "ok" | "error" | "queue_key_not_configured" | "not_configured"
     status                        STRING,
 
-    -- Redis server version (null when unreachable)
-    redis_version                 STRING,
-
-    -- Seconds since Redis process started (null when unreachable)
-    uptime_seconds                INTEGER,
-
-    -- Number of connected clients (null when unreachable)
-    connected_clients             INTEGER,
-
-    -- RSS memory used by Redis in bytes (null when unreachable)
-    used_memory_bytes             INTEGER,
-
-    -- Cumulative total commands processed since start (null when unreachable)
-    total_commands_processed      INTEGER,
-
-    -- Cumulative keyspace cache hits (null when unreachable)
-    keyspace_hits                 INTEGER,
-
-    -- Cumulative keyspace cache misses (null when unreachable)
-    keyspace_misses               INTEGER,
-
     -- Redis stream / list key being monitored (e.g. "pixel:events")
     queue_key                     STRING      NOT NULL,
 
     -- Pending entries in the monitored stream/list (null when OPS_REDIS_QUEUE_KEY not set)
-    queue_depth                   INTEGER,
+    queue_depth                   INT64,
+
+    -- RSS memory used by Redis in bytes (from used_memory in INFO output)
+    used_memory                   INT64,
+
+    -- Human-readable memory usage (e.g. "42.50M"), from used_memory_human in INFO
+    used_memory_human             STRING,
+
+    -- Number of connected clients (from connected_clients in INFO)
+    connected_clients             INT64,
+
+    -- Number of clients pending on a blocking call (from blocked_clients in INFO)
+    blocked_clients               INT64,
+
+    -- Number of commands processed per second (from instantaneous_ops_per_sec in INFO)
+    instantaneous_ops_per_sec     INT64,
+
+    -- Cumulative total commands processed since start (from total_commands_processed in INFO)
+    total_commands_processed      INT64,
+
+    -- Cumulative keyspace cache hits (from keyspace_hits in INFO)
+    keyspace_hits                 INT64,
+
+    -- Cumulative keyspace cache misses (from keyspace_misses in INFO)
+    keyspace_misses               INT64,
+
+    -- Redis replication role: "master" | "slave" | "sentinel" (from role in INFO)
+    role                          STRING,
+
+    -- Seconds since Redis process started (from uptime_in_seconds in INFO)
+    uptime_in_seconds             INT64,
+
+    -- Redis server version string (from redis_version in INFO)
+    redis_version                 STRING,
 
     -- Error message when status != "ok", null otherwise
     error                         STRING,

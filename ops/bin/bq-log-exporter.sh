@@ -14,7 +14,7 @@
 #
 # Required env (via ops/.env or .env.ops):
 #   OPS_BQ_EXPORT_ENABLED=1          — master switch; exits 0 silently when absent/0
-#   OPS_BQ_PROJECT                   — GCP project id
+#   OPS_BQ_PROJECT_ID                — GCP project id (OPS_BQ_PROJECT accepted as fallback)
 #   OPS_BQ_DATASET                   — BigQuery dataset name
 #
 # Optional env (see ops/lib/bq-export.lib.sh for full list):
@@ -51,13 +51,14 @@ DRY_FLAG=""
 # Master switch — write disabled status and exit 0 when not enabled.
 # ---------------------------------------------------------------------------
 EXPORT_ENABLED="${OPS_BQ_EXPORT_ENABLED:-0}"
+DATE="$(date -u +%Y-%m-%d)"
+
 if [ "$EXPORT_ENABLED" != "1" ]; then
     bq_write_latest \
-        "0" \
-        "disabled" "disabled" "" "0" "0" \
-        "disabled" "0" \
-        "disabled" "" "" \
-        "" "" "0"
+        "0" "disabled" "$DATE" \
+        "no_source" "0" "0" "" \
+        "not_configured" "0" "0" "" \
+        "0" "" "" "" "" ""
     jlog "info" "$ROLE" "bq-export disabled (OPS_BQ_EXPORT_ENABLED!=1); set it in ops/.env to enable" "{}"
     exit 0
 fi
@@ -65,7 +66,7 @@ fi
 # ---------------------------------------------------------------------------
 # BQ table config
 # ---------------------------------------------------------------------------
-BQ_PROJECT="${OPS_BQ_PROJECT:-}"
+BQ_PROJECT="${OPS_BQ_PROJECT_ID:-${OPS_BQ_PROJECT:-}}"
 BQ_DATASET="${OPS_BQ_DATASET:-}"
 NGINX_TABLE_NAME="${OPS_BQ_NGINX_TABLE:-nginx_requests}"
 REDIS_TABLE_NAME="${OPS_BQ_REDIS_TABLE:-redis_metrics}"
@@ -83,11 +84,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Staging directories
+# Staging directories — always create both bq/ and docker/ for the day (req 4)
 # ---------------------------------------------------------------------------
-DATE="$(date -u +%Y-%m-%d)"
 STAGING_DIR="$LOGS_DIR/$DATE/bq"
 mkdir -p "$STAGING_DIR"
+mkdir -p "$LOGS_DIR/$DATE/docker"
 
 NGINX_NDJSON="$STAGING_DIR/nginx_requests.ndjson"
 REDIS_NDJSON="$STAGING_DIR/redis_metrics.ndjson"
@@ -104,15 +105,16 @@ nginx_collect "$STAGING_DIR"
 NGINX_ROWS_THIS_RUN="$NGINX_ROWS_STAGED"
 
 jlog "info" "$ROLE" "nginx collect" \
-    "{\"status\":$(json_str "$NGINX_STATUS"),\"source\":$(json_str "$NGINX_SOURCE"),\"container\":$(json_str "${NGINX_CONTAINER:-}"),\"rows\":${NGINX_ROWS_THIS_RUN}}"
+    "{\"status\":$(json_str "$NGINX_STATUS"),\"source_status\":$(json_str "$NGINX_SOURCE_STATUS"),\"source\":$(json_str "$NGINX_SOURCE"),\"container\":$(json_str "${NGINX_CONTAINER:-}"),\"rows\":${NGINX_ROWS_THIS_RUN}}"
 
 # ---------------------------------------------------------------------------
-# Collect Redis metrics (one row per run)
+# Collect Redis metrics (one row per run when Redis is reachable)
 # ---------------------------------------------------------------------------
 redis_collect "$STAGING_DIR"
+REDIS_ROWS_THIS_RUN="$REDIS_ROWS_STAGED"
 
 jlog "info" "$ROLE" "redis collect" \
-    "{\"status\":$(json_str "$REDIS_STATUS"),\"container\":$(json_str "${REDIS_CONTAINER_USED:-}")}"
+    "{\"status\":$(json_str "$REDIS_STATUS"),\"source_status\":$(json_str "$REDIS_SOURCE_STATUS"),\"container\":$(json_str "${REDIS_CONTAINER_USED:-}"),\"rows\":${REDIS_ROWS_THIS_RUN}}"
 
 # ---------------------------------------------------------------------------
 # Staging backlog: total rows in today's NDJSON files.
@@ -210,16 +212,32 @@ NOW="$(ts_now)"
 bq_write_cursor "$NOW"
 
 # ---------------------------------------------------------------------------
-# Write shared status JSON
+# Compute top-level status for bq-export-latest.json (req 6)
+# ---------------------------------------------------------------------------
+TOP_STATUS="ok"
+if [ "$CONFIG_MISSING" = "1" ]; then
+    TOP_STATUS="not_configured"
+elif [ "$UPLOAD_STATUS" = "disabled" ]; then
+    TOP_STATUS="disabled"
+elif [ "$UPLOAD_STATUS" = "failed" ] || [ "$UPLOAD_STATUS" = "auth_missing" ]; then
+    TOP_STATUS="error"
+elif [ "$NGINX_STATUS" = "error" ] || [ "$REDIS_STATUS" = "error" ]; then
+    TOP_STATUS="partial"
+fi
+
+# Upload_enabled = project + dataset configured
+UPLOAD_ENABLED="0"
+[ "$CONFIG_MISSING" = "0" ] && UPLOAD_ENABLED="1"
+
+# ---------------------------------------------------------------------------
+# Write shared status JSON (req 6 — new schema)
 # ---------------------------------------------------------------------------
 bq_write_latest \
-    "1" \
-    "$NGINX_STATUS" "$NGINX_SOURCE" "${NGINX_CONTAINER:-}" \
-    "$NGINX_ROWS_THIS_RUN" "$NGINX_UPLOADED" \
-    "$REDIS_STATUS" "$REDIS_UPLOADED" \
-    "$UPLOAD_STATUS" "${UPLOAD_TS:-}" "${UPLOAD_ERR:-}" \
-    "${NGINX_FQTN:-}" "${REDIS_FQTN:-}" \
-    "$BACKLOG_ROWS"
+    "1" "$TOP_STATUS" "$DATE" \
+    "$NGINX_SOURCE_STATUS" "$NGINX_ROWS_THIS_RUN" "$NGINX_UPLOADED" "${NGINX_NDJSON:-}" \
+    "$REDIS_SOURCE_STATUS" "$REDIS_ROWS_THIS_RUN" "$REDIS_UPLOADED" "${REDIS_NDJSON:-}" \
+    "$UPLOAD_ENABLED" "${BQ_PROJECT:-}" "${BQ_DATASET:-}" \
+    "${NGINX_FQTN:-}" "${REDIS_FQTN:-}" "${UPLOAD_ERR:-}"
 
 # ---------------------------------------------------------------------------
 # Alerts (state-change dedup; fires only when export is enabled)
@@ -264,6 +282,6 @@ bq_flush_alert_state
 # ---------------------------------------------------------------------------
 heartbeat "$ROLE"
 jlog "info" "$ROLE" "bq-export run complete" \
-    "{\"nginx_status\":$(json_str "$NGINX_STATUS"),\"nginx_rows\":${NGINX_ROWS_THIS_RUN},\"nginx_uploaded\":${NGINX_UPLOADED},\"redis_status\":$(json_str "$REDIS_STATUS"),\"redis_uploaded\":${REDIS_UPLOADED},\"upload_status\":$(json_str "$UPLOAD_STATUS"),\"backlog_rows\":${BACKLOG_ROWS},\"dry_run\":$([ -n "$DRY_FLAG" ] && echo true || echo false)}"
+    "{\"nginx_status\":$(json_str "$NGINX_STATUS"),\"nginx_source_status\":$(json_str "$NGINX_SOURCE_STATUS"),\"nginx_rows\":${NGINX_ROWS_THIS_RUN},\"nginx_uploaded\":${NGINX_UPLOADED},\"redis_status\":$(json_str "$REDIS_STATUS"),\"redis_source_status\":$(json_str "$REDIS_SOURCE_STATUS"),\"redis_rows\":${REDIS_ROWS_THIS_RUN},\"redis_uploaded\":${REDIS_UPLOADED},\"upload_status\":$(json_str "$UPLOAD_STATUS"),\"top_status\":$(json_str "$TOP_STATUS"),\"backlog_rows\":${BACKLOG_ROWS},\"dry_run\":$([ -n "$DRY_FLAG" ] && echo true || echo false)}"
 
 exit 0

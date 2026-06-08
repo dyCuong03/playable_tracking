@@ -25,8 +25,8 @@ CREATE TABLE IF NOT EXISTS `%%PROJECT%%.%%DATASET%%.%%TABLE%%`
     -- Collector / exporter identity
     source                   STRING      NOT NULL,   -- e.g. "nginx-exporter", hostname
 
-    -- Docker container that emitted the log line
-    container                STRING      NOT NULL,
+    -- Docker container that emitted the log line (null when source="file")
+    container                STRING,
 
     -- Hashed client IP (SHA-256 prefix, never raw IP)
     remote_ip_hash           STRING,
@@ -43,8 +43,11 @@ CREATE TABLE IF NOT EXISTS `%%PROJECT%%.%%DATASET%%.%%TABLE%%`
     -- HTTP response status code (200, 404, 503 …)
     status                   INTEGER,
 
-    -- Upstream response time in milliseconds (nginx $request_time * 1000)
+    -- Total request processing time in milliseconds (nginx $request_time × 1000)
     request_time_ms          FLOAT64,
+
+    -- Time spent waiting for the upstream in milliseconds (nginx $upstream_response_time × 1000)
+    upstream_response_time_ms FLOAT64,
 
     -- Bytes sent in the response body
     body_bytes_sent          INTEGER,
@@ -58,7 +61,10 @@ CREATE TABLE IF NOT EXISTS `%%PROJECT%%.%%DATASET%%.%%TABLE%%`
     -- Nginx $request_id or equivalent correlation id
     request_id               STRING,
 
-    -- Optional raw log sample for debugging (truncated)
+    -- Log format identifier: "json" (pixel_json) or "combined" (fallback)
+    raw_format               STRING,
+
+    -- Truncated raw log line for debugging
     raw_sample               STRING,
 
     -- Dedup key — SHA-256 of (ts, container, request_id); used as BigQuery insertId

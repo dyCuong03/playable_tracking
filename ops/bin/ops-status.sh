@@ -92,34 +92,20 @@ PY
 }
 
 # Render BigQuery export status from bq-export-latest.json.
-# Schema from core (task#1). Three states: disabled / enabled+missing-config / enabled+running.
-# bq-export-latest.json shape:
-#   {ts, enabled, nginx:{status,source,container,rows_staged,rows_uploaded_last},
-#    redis:{status,rows_uploaded_last}, upload:{status,last_upload_ts,error},
-#    tables:{nginx,redis}, staging_backlog_rows}
+# New schema (from core): {enabled, status(ok|disabled|not_configured|partial|error), date,
+#   nginx:{source_status, rows_staged, rows_uploaded, staging_file},
+#   redis:{source_status, rows_staged, rows_uploaded, staging_file},
+#   bigquery:{upload_enabled, project_id, dataset, nginx_table, redis_table, last_error}}
 render_bq() {
     OPS_BQ_EXPORT_ENABLED="${OPS_BQ_EXPORT_ENABLED:-0}" \
-    OPS_BQ_PROJECT_ID="${OPS_BQ_PROJECT_ID:-}" \
-    GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS:-}" \
     BQ_LATEST="$STATUS_DIR/bq-export-latest.json" python3 - <<'PY'
 import json, os, sys
 
-enabled  = os.environ.get("OPS_BQ_EXPORT_ENABLED", "0") == "1"
-project  = os.environ.get("OPS_BQ_PROJECT_ID", "").strip()
-creds    = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-bq_file  = os.environ.get("BQ_LATEST", "")
+enabled = os.environ.get("OPS_BQ_EXPORT_ENABLED", "0") == "1"
+bq_file = os.environ.get("BQ_LATEST", "")
 
 if not enabled:
     print("BigQuery log export disabled. Set OPS_BQ_EXPORT_ENABLED=1.")
-    sys.exit(0)
-
-missing = []
-if not project:
-    missing.append("OPS_BQ_PROJECT_ID")
-if not creds:
-    missing.append("GOOGLE_APPLICATION_CREDENTIALS")
-if missing:
-    print("BigQuery export enabled but missing %s." % " / ".join(missing))
     sys.exit(0)
 
 try:
@@ -133,27 +119,51 @@ except Exception as e:
     sys.exit(0)
 
 def show(label, val):
-    print("%-26s %s" % (label + ":", val if val not in (None, "") else "n/a"))
+    if val is None or val == "":
+        val = "n/a"
+    elif val is True:
+        val = "yes"
+    elif val is False:
+        val = "no"
+    else:
+        val = str(val)
+    print("%-28s %s" % (label + ":", val))
 
-ng  = d.get("nginx", {})
-rd  = d.get("redis", {})
-up  = d.get("upload", {})
-tbl = d.get("tables", {})
+status = d.get("status", "unknown")
+date   = d.get("date", "")
 
-show("last run",             d.get("ts"))
-show("upload status",        up.get("status"))
-show("last upload",          up.get("last_upload_ts"))
-show("nginx status",         ng.get("status"))
-show("nginx source",         ng.get("source"))
-show("nginx staged",         ng.get("rows_staged"))
-show("nginx uploaded (last)", ng.get("rows_uploaded_last"))
-show("redis status",         rd.get("status"))
-show("redis uploaded (last)", rd.get("rows_uploaded_last"))
-show("staging backlog rows", d.get("staging_backlog_rows"))
-show("table nginx",          tbl.get("nginx"))
-show("table redis",          tbl.get("redis"))
-if up.get("error"):
-    show("upload error",     up.get("error"))
+show("status",      status)
+show("date",        date)
+show("staging dir", ("ops/logs/%s/bq/" % date) if date else "n/a")
+
+ng = d.get("nginx",    {}) or {}
+rd = d.get("redis",    {}) or {}
+bq = d.get("bigquery", {}) or {}
+
+print()
+print("== nginx ==")
+show("  source status",  ng.get("source_status"))
+show("  rows staged",    ng.get("rows_staged"))
+show("  rows uploaded",  ng.get("rows_uploaded"))
+show("  staging file",   ng.get("staging_file"))
+
+print()
+print("== redis ==")
+show("  source status",  rd.get("source_status"))
+show("  rows staged",    rd.get("rows_staged"))
+show("  rows uploaded",  rd.get("rows_uploaded"))
+show("  staging file",   rd.get("staging_file"))
+
+print()
+print("== bigquery ==")
+show("  upload enabled", bq.get("upload_enabled"))
+show("  project",        bq.get("project_id"))
+show("  dataset",        bq.get("dataset"))
+show("  nginx table",    bq.get("nginx_table"))
+show("  redis table",    bq.get("redis_table"))
+last_err = bq.get("last_error")
+if last_err:
+    show("  last error",  last_err)
 PY
 }
 
@@ -199,6 +209,9 @@ PY
     ;;
 gate)
     render_table
+    GATE_FAIL=0
+
+    # Core 3-daemon health check.
     printf '%s\n' "$DATA" | python3 -c '
 import sys, json
 bad = [json.loads(l)["name"] for l in sys.stdin if l.strip() and not json.loads(l)["healthy"]]
@@ -206,7 +219,42 @@ if bad:
     print("UNHEALTHY: " + ", ".join(bad))
     sys.exit(1)
 print("all daemons healthy")
-'
+' || GATE_FAIL=1
+
+    # BQ exporter gate — only active when OPS_BQ_EXPORT_ENABLED=1.
+    # not_configured -> ok (no creds yet, don't hard-fail).
+    # error -> fail.  partial + last_error -> fail.
+    if [ "${OPS_BQ_EXPORT_ENABLED:-0}" = "1" ]; then
+        BQ_LATEST="$STATUS_DIR/bq-export-latest.json" \
+        python3 - <<'BQ_PY' || GATE_FAIL=1
+import json, os, sys
+bq_file = os.environ.get("BQ_LATEST", "")
+try:
+    with open(bq_file) as f:
+        d = json.load(f)
+except FileNotFoundError:
+    print("bq-export: ok (not run yet — skipping gate)")
+    sys.exit(0)
+except Exception as e:
+    print("bq-export: warning (cannot read status: %s)" % e)
+    sys.exit(0)
+status    = d.get("status", "")
+last_err  = (d.get("bigquery") or {}).get("last_error")
+if status == "error":
+    msg = "bq-export UNHEALTHY: status=error"
+    if last_err:
+        msg += " (%s)" % last_err
+    print(msg)
+    sys.exit(1)
+if status == "partial" and last_err:
+    print("bq-export UNHEALTHY: status=partial last_error=%s" % last_err)
+    sys.exit(1)
+# not_configured / ok / disabled / partial-no-error -> ok
+print("bq-export ok: status=%s" % (status or "unknown"))
+BQ_PY
+    fi
+
+    [ "$GATE_FAIL" -eq 0 ] || exit 1
     ;;
 *)
     render_table
