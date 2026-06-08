@@ -205,13 +205,13 @@ fi
 P_SERVER="$(pcount 'src/server.js')"
 P_WORKER="$(pcount 'src/worker.js')"
 P_DISPATCH="$(pcount 'src/dispatcher.js')"
-DOCKER_PIXEL="null"
 
 # --- Docker container health (read-only inspect) ---
+# Configurable via OPS_DOCKER_CONTAINERS; the detailed `docker` section below is
+# the single source of truth (replaces the old hardcoded `grep -c '^pixel-'`).
 # DOCKER_HELPER_OUT carries a "DOCKER\t<json>" line plus "ALERT\t..." lines.
 DOCKER_HELPER_OUT=""
 if [ "$DOCKER_STATE" = "ok" ]; then
-    DOCKER_PIXEL="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c '^pixel-')" || DOCKER_PIXEL="null"
     DOCKER_HELPER_OUT="$(OPS_DOCKER_CONTAINERS="${OPS_DOCKER_CONTAINERS:-}" python3 - <<'PY' 2>/dev/null || true
 import json, os, subprocess
 
@@ -299,7 +299,7 @@ read DISK_TOTAL DISK_USED DISK_AVAIL DISK_PCT <<<"$(df -Pk "$REPO_DIR" | awk 'NR
 # Snapshot JSON
 # ---------------------------------------------------------------------------
 SNAP="$(cat <<JSON
-{"ts":"$(ts_now)","role":"$ROLE","health":{"url":$(json_str "$HEALTH_URL"),"http_code":$(json_str "$HEALTH_CODE"),"latency_ms":${HEALTH_MS}},"pixel":${PIXEL_JSON},"redis":${REDIS_JSON},"docker":${DOCKER_JSON},"disk_queue":{"pending":{"files":${PEND_F},"bytes":${PEND_B}},"ready":{"files":${READY_F},"bytes":${READY_B}},"processing":{"files":${PROC_F},"bytes":${PROC_B}},"rejected":{"files":${REJ_F},"bytes":${REJ_B}},"total_files":${TOTAL_F},"total_bytes":${TOTAL_B},"backlog_files":${BACKLOG_F},"stuck_processing":${STUCK_COUNT},"oldest_processing_s":${OLDEST_PROC}},"processes":{"server":${P_SERVER},"worker":${P_WORKER},"dispatcher":${P_DISPATCH},"docker_pixel":${DOCKER_PIXEL}},"system":{"loadavg_1m":${LA1},"loadavg_5m":${LA5},"loadavg_15m":${LA15},"nproc":${NPROC},"mem_total_mb":${MEM_TOTAL},"mem_used_mb":${MEM_USED},"mem_free_mb":${MEM_FREE},"disk":{"total_kb":${DISK_TOTAL:-0},"used_kb":${DISK_USED:-0},"avail_kb":${DISK_AVAIL:-0},"use_pct":${DISK_PCT:-0}}}}
+{"ts":"$(ts_now)","role":"$ROLE","health":{"url":$(json_str "$HEALTH_URL"),"http_code":$(json_str "$HEALTH_CODE"),"latency_ms":${HEALTH_MS}},"pixel":${PIXEL_JSON},"redis":${REDIS_JSON},"docker":${DOCKER_JSON},"disk_queue":{"pending":{"files":${PEND_F},"bytes":${PEND_B}},"ready":{"files":${READY_F},"bytes":${READY_B}},"processing":{"files":${PROC_F},"bytes":${PROC_B}},"rejected":{"files":${REJ_F},"bytes":${REJ_B}},"total_files":${TOTAL_F},"total_bytes":${TOTAL_B},"backlog_files":${BACKLOG_F},"stuck_processing":${STUCK_COUNT},"oldest_processing_s":${OLDEST_PROC}},"processes":{"server":${P_SERVER},"worker":${P_WORKER},"dispatcher":${P_DISPATCH}},"system":{"loadavg_1m":${LA1},"loadavg_5m":${LA5},"loadavg_15m":${LA15},"nproc":${NPROC},"mem_total_mb":${MEM_TOTAL},"mem_used_mb":${MEM_USED},"mem_free_mb":${MEM_FREE},"disk":{"total_kb":${DISK_TOTAL:-0},"used_kb":${DISK_USED:-0},"avail_kb":${DISK_AVAIL:-0},"use_pct":${DISK_PCT:-0}}}}
 JSON
 )"
 
