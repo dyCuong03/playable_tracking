@@ -10,8 +10,11 @@
 # and raises an "error-spike" alert when this window's errors exceed ERROR_SPIKE.
 #
 # Designed for a NOT-yet-deployed server: every source is optional. Missing
-# sources are skipped cleanly; missing docker/containers produce a timestamped
-# _docker-unavailable.log. Never aborts on a single source failure.
+# sources are skipped cleanly. Docker status is written to a reason-specific file
+# so the name never lies: _docker-unavailable.log (no CLI / denied / no daemon),
+# _docker-skipped.log (reachable but all_visible mode, opt-in off),
+# _docker-no-matching-containers.log, or _docker-logs-failed.log. Never aborts
+# on a single source failure.
 set -u
 . "$(dirname "$0")/../lib/common.sh"
 
@@ -197,10 +200,22 @@ case "$DOCKER_STATE" in ok) ;; *) DOCKER_WARN_CODE="docker_unavailable_or_permis
 
 if [ "$DOCKER_STATE" = "ok" ]; then
     if [ "$DISCOVERY_MODE" = "all_visible" ] && [ "${OPS_DOCKER_LOG_ALL_VISIBLE:-0}" != "1" ]; then
-        # all_visible mode: skip collection unless the operator explicitly opts in.
-        jlog "info" "$ROLE" "docker log collection skipped in all_visible mode (set OPS_DOCKER_LOG_ALL_VISIBLE=1 to enable)" \
-            "{\"discovery_mode\":\"all_visible\"}" >> "$DOCKER_REASONS"
+        # Docker IS reachable. Collection is intentionally skipped because no
+        # expected container set is configured and all-visible opt-in is off.
+        # This is NOT a docker-unavailable condition (see _docker-skipped.log).
         DOCKER_ZERO_REASON="all_visible_mode_skip"
+        jlog "info" "$ROLE" "docker log collection skipped: all_visible mode" \
+            "{\"reason\":\"all_visible_mode_skip\",\"discovery_mode\":$(json_str "$DISCOVERY_MODE"),\"ops_docker_log_all_visible\":$(json_str "${OPS_DOCKER_LOG_ALL_VISIBLE:-0}")}" >> "$DOCKER_REASONS"
+        {
+            printf 'reason=all_visible_mode_skip\n'
+            printf 'discovery_mode=%s\n' "$DISCOVERY_MODE"
+            printf 'OPS_DOCKER_LOG_ALL_VISIBLE=%s\n' "${OPS_DOCKER_LOG_ALL_VISIBLE:-0}"
+            printf 'docker is reachable; container logs are NOT collected until you do ONE of:\n'
+            printf '  - set OPS_DOCKER_COMPOSE_PROJECT=<compose_project> in ops/.env (recommended)\n'
+            printf '  - set OPS_DOCKER_CONTAINERS="name1 name2 ..." in ops/.env\n'
+            printf '  - set OPS_DOCKER_LOG_ALL_VISIBLE=1 in ops/.env to collect all visible containers\n'
+            [ -n "$ALL_VISIBLE" ] && printf 'visible containers: %s\n' "$ALL_VISIBLE"
+        } >> "$DOCKER_REASONS"
     else
         [ "$DISCOVERY_MODE" = "all_visible" ] && COLLECT_CONTAINERS="$ALL_VISIBLE" || COLLECT_CONTAINERS="$CONTAINERS"
         if [ -z "$COLLECT_CONTAINERS" ]; then
@@ -250,10 +265,24 @@ else
     jlog "warn" "$ROLE" "docker daemon unreachable - container logs skipped" "{\"reason\":\"no_daemon\"}" >> "$DOCKER_REASONS"
 fi
 
+# Route the status file by the ACTUAL reason so a name never lies. Docker being
+# reachable but skipped must NOT land in _docker-unavailable.log.
 if [ -s "$DOCKER_REASONS" ]; then
-    cat "$DOCKER_REASONS" > "$DOCKER_UNAVAIL"
+    if [ "$DOCKER_STATE" = "ok" ]; then
+        case "$DOCKER_ZERO_REASON" in
+            no-matching-containers) DOCKER_STATUS_FILE="$CONTDIR/_docker-no-matching-containers.log" ;;
+            docker-logs-failed)     DOCKER_STATUS_FILE="$CONTDIR/_docker-logs-failed.log" ;;
+            *)                      DOCKER_STATUS_FILE="$CONTDIR/_docker-skipped.log" ;;
+        esac
+    else
+        # no_cli / permission_denied / no_daemon / unavailable — genuinely unavailable.
+        DOCKER_STATUS_FILE="$DOCKER_UNAVAIL"
+    fi
+    cat "$DOCKER_REASONS" > "$DOCKER_STATUS_FILE"
 fi
 rm -f "$DOCKER_REASONS"
+# Clear a stale _docker-unavailable.log from an earlier run when docker is now ok.
+[ "$DOCKER_STATE" = "ok" ] && rm -f "$DOCKER_UNAVAIL" 2>/dev/null || true
 
 # ---- 3. pm2 snapshot --------------------------------------------------------
 if command -v pm2 >/dev/null 2>&1; then
@@ -276,12 +305,13 @@ ROLLUP="$DAYDIR/errors-rollup.txt"
     printf '# sources_collected=%s  docker_status=%s  discovery_mode=%s\n' "${#SRC_NAMES[@]}" "$DOCKER_STATUS" "$DISCOVERY_MODE"
     [ -n "$DOCKER_WARN_CODE" ] && printf '# %s: %s\n' "$DOCKER_WARN_CODE" "$DOCKER_WARNING"
     [ -n "$DOCKER_ZERO_REASON" ] && printf '# docker_zero_reason: %s\n' "$DOCKER_ZERO_REASON"
+    [ "$DOCKER_ZERO_REASON" = "all_visible_mode_skip" ] && printf '# docker log collection skipped: all_visible mode (set OPS_DOCKER_COMPOSE_PROJECT or OPS_DOCKER_LOG_ALL_VISIBLE=1)\n'
     [ "$EXPECTED_CONFIGURED" = "false" ] && [ "$DISCOVERY_MODE" != "all_visible" ] && printf '# expected-containers-not-configured: set OPS_DOCKER_COMPOSE_PROJECT or OPS_DOCKER_CONTAINERS\n'
     printf '\n'
     shopt -s nullglob
     for f in "$DAYDIR/app.log" "$DAYDIR/local-server.out.log" "$DAYDIR/local-server.err.log" "$CONTDIR"/*.log; do
         [ -f "$f" ] || continue
-        case "$(basename "$f")" in _docker-unavailable.log) continue;; esac
+        case "$(basename "$f")" in _docker-*.log) continue;; esac
         # Container logs are raw stdout/stderr -> use the broader matchers.
         case "$f" in "$CONTDIR"/*) e_re="$GENERIC_ERR_RE"; w_re="$GENERIC_WARN_RE";; *) e_re="$ERR_RE"; w_re="$WARN_RE";; esac
         ec=$(count_re "$f" "$e_re")
@@ -308,6 +338,7 @@ DOCKER_JSON_SUMMARY="{\"status\":$(json_str "$DOCKER_STATUS"),\"available\":${DO
 [ -n "$DOCKER_WARNING" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"warning\":$(json_str "$DOCKER_WARNING")"
 [ -n "$DOCKER_WARN_CODE" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"warning_code\":$(json_str "$DOCKER_WARN_CODE")"
 [ -n "$DOCKER_ZERO_REASON" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"zero_reason\":$(json_str "$DOCKER_ZERO_REASON")"
+[ -n "${DOCKER_STATUS_FILE:-}" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"status_file\":$(json_str "${DOCKER_STATUS_FILE#$REPO_DIR/}")"
 DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"containers_configured\":${EXPECTED_CONFIGURED},\"containers_watched\":$(json_str "$CONTAINERS")}"
 
 SUMMARY="{\"ts\":\"$(ts_now)\",\"role\":\"$ROLE\",\"date\":\"$DATE\",\"sources\":$SOURCES_JSON,\"source_count\":${#SRC_NAMES[@]},\"total_errors\":$TOTAL_ERR,\"total_warns\":$TOTAL_WARN,\"docker\":$DOCKER_JSON_SUMMARY}"

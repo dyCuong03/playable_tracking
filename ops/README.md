@@ -191,6 +191,33 @@ health on a missing name. logcollector also collects
 `ops/logs/<date>/docker/<container>.log` and folds error/warn/fatal/exception
 lines into `errors-rollup.txt`.
 
+#### `all_visible` mode — log collection is opt-in
+
+When **no** expected container set is configured (`OPS_DOCKER_COMPOSE_PROJECT`,
+`OPS_DOCKER_CONTAINERS`, or a prefix are all unset), discovery runs in
+**`all_visible` mode**: it *lists* every running container for visibility but does
+**not** collect their logs by default. Docker is reachable — collection is simply
+not enabled for unknown containers. In that state logcollector writes
+`ops/logs/<date>/docker/_docker-skipped.log` (reason `all_visible_mode_skip`, with
+next actions) — **not** `_docker-unavailable.log`, which is reserved for a missing
+CLI / permission-denied / unreachable daemon. The rollup line reads
+`docker log collection skipped: all_visible mode`.
+
+To start collecting container logs, do **one** of (recommended first):
+
+```bash
+# in ops/.env
+OPS_DOCKER_COMPOSE_PROJECT=<compose_project>      # recommended — also gates health
+# OPS_DOCKER_CONTAINERS="pixel-nginx pixel-redis pixel-server pixel-worker"
+# OPS_DOCKER_LOG_ALL_VISIBLE=1                     # collect every visible container
+```
+
+Status-file names by reason: `_docker-unavailable.log` (no CLI / denied / no
+daemon), `_docker-skipped.log` (reachable but all_visible, opt-in off),
+`_docker-no-matching-containers.log` (expected set configured but none present),
+`_docker-logs-failed.log` (`docker logs` failed for some containers — also
+summarised in the rollup).
+
 ### Docker permission setup
 
 If Docker is installed but you see `permission_ok=false` / `permission_denied`
@@ -718,7 +745,10 @@ privacy-filtered, IPs are hashed, and timestamps are normalised to UTC.
 On a dev machine or WSL2 where the Docker daemon is unavailable:
 
 - `docker/` contains only `_docker-unavailable.log` (the logcollector recorded
-  why container logs were skipped).
+  why container logs were skipped — no CLI / permission denied / no daemon).
+  On a real VPS where Docker **is** reachable but you have not configured an
+  expected container set, you will instead see `_docker-skipped.log`
+  (`all_visible_mode_skip`) — see the `all_visible` section above for the fix.
 - `bq/nginx_requests.status.json` is written instead of `.ndjson` — the nginx
   exporter could not reach any source (`docker_unavailable` or
   `no_nginx_source`). The file records `source_status` and `reason` so you know
@@ -739,7 +769,9 @@ run normally; only the BQ exporter reports incomplete data.
 # Verify today's dated directories exist
 ls -la ops/logs/$(date -u +%F)/
 
-# Check for real docker logs (not just _docker-unavailable.log)
+# Check for real docker logs (not just a _docker-*.log status file).
+# _docker-skipped.log => Docker is fine but no expected containers configured
+# (set OPS_DOCKER_COMPOSE_PROJECT / OPS_DOCKER_CONTAINERS / OPS_DOCKER_LOG_ALL_VISIBLE=1).
 ls -la ops/logs/$(date -u +%F)/docker/
 
 # Check BQ staging files — expect *.ndjson, not just *.status.json
