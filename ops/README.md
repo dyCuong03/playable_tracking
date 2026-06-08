@@ -343,6 +343,307 @@ ops/
 | `LOADTEST_ENV` / `ALLOW_PROD_LOADTEST` | `test` / `0` | production target requires both set |
 | `DASH_REFRESH` | `5` | dashboard pane refresh (s) |
 
+## BigQuery log export
+
+The ops layer can export nginx request logs and Redis queue-depth metrics to
+BigQuery for long-term analysis. The feature is **off by default**
+(`OPS_BQ_EXPORT_ENABLED=0`) and does nothing unless explicitly enabled on the
+VPS. The existing three daemons (monitor, logcollector, capacity) continue to
+run normally with or without it.
+
+### What each export does
+
+**nginx request log export** (`OPS_BQ_NGINX_TABLE`, default `nginx_requests`)
+
+Tails the nginx access log inside the nginx container (via `docker exec cat
+<path>`) on every `OPS_BQ_EXPORT_INTERVAL_SECONDS` cycle. Each line is parsed
+into structured fields (`timestamp`, `method`, `uri`, `status`, `bytes_sent`,
+`request_time`, `request_id`, `ip_hash`, `query_params`), cursor-tracked so
+lines are never re-exported, and batch-inserted into BigQuery. Combined with the
+custom `log_format` described at the end of this section, you get
+`request_time` (latency) and a correlation `request_id` per row.
+
+**Redis metrics export** (`OPS_BQ_REDIS_TABLE`, default `redis_metrics`)
+
+On each cycle, reads the Redis stream depth (`XLEN pixel:events`) via
+`docker exec` (same path the monitor uses) and writes one row per sample:
+`{timestamp, queue_key, depth, worker_count}`. Use this to correlate queue
+backlog spikes with error-rate spikes in the nginx table.
+
+### BigQuery setup
+
+#### 1. Create the dataset
+
+```sql
+CREATE SCHEMA `<OPS_BQ_PROJECT_ID>.<OPS_BQ_DATASET>`
+  OPTIONS (location = 'US');   -- match the region of your pixel_events tables
+```
+
+#### 2. Create partitioned tables
+
+**nginx_requests** (partitioned by event date, clustered for common WHERE clauses):
+
+```sql
+CREATE TABLE `<project>.<dataset>.nginx_requests`
+(
+  event_date     DATE         NOT NULL OPTIONS (description='Partition column'),
+  timestamp      TIMESTAMP    NOT NULL,
+  method         STRING,
+  uri            STRING,
+  status         INT64,
+  bytes_sent     INT64,
+  request_time   FLOAT64,     -- seconds; requires custom log_format (see below)
+  request_id     STRING,      -- requires $request_id in log_format
+  ip_hash        STRING,      -- SHA-256 of client IP (OPS_LOG_HASH_IP=1)
+  query_params   JSON         -- filtered by OPS_LOG_QUERY_ALLOWLIST
+)
+PARTITION BY event_date
+CLUSTER BY status, uri
+OPTIONS (
+  require_partition_filter = false,
+  partition_expiration_days = 90
+);
+```
+
+**redis_metrics**:
+
+```sql
+CREATE TABLE `<project>.<dataset>.redis_metrics`
+(
+  event_date    DATE      NOT NULL OPTIONS (description='Partition column'),
+  timestamp     TIMESTAMP NOT NULL,
+  queue_key     STRING,
+  depth         INT64,
+  worker_count  INT64
+)
+PARTITION BY event_date
+OPTIONS (partition_expiration_days = 90);
+```
+
+Set `OPS_BQ_CREATE_TABLES=1` to let the exporter create these tables
+automatically on first run (uses the schemas above). Leave it at `0` if you
+want manual control over schema options.
+
+#### 3. IAM
+
+The service-account that runs the exporter needs two roles on the BigQuery
+**dataset** (not the project root — least-privilege):
+
+| Role | Why |
+|------|-----|
+| `roles/bigquery.dataEditor` | Insert rows, create tables when `OPS_BQ_CREATE_TABLES=1` |
+| `roles/bigquery.jobUser`    | Run insert jobs (project-level role) |
+
+```bash
+# grant dataEditor on the dataset
+gcloud projects add-iam-policy-binding <project> \
+  --member="serviceAccount:<sa>@<project>.iam.gserviceaccount.com" \
+  --role="roles/bigquery.dataEditor" \
+  --condition="expression=resource.name.startsWith('projects/<project>/datasets/<dataset>'),title=ops-export-dataset"
+
+# grant jobUser at project level
+gcloud projects add-iam-policy-binding <project> \
+  --member="serviceAccount:<sa>@<project>.iam.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+```
+
+Download the key JSON, copy it to the VPS (never commit it), and set the path in
+`ops/.env`:
+
+```bash
+scp pixel-ops-sa.json user@vps:/path/to/playable_tracking/app/credentials/pixel-ops-sa.json
+# then in ops/.env:
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/playable_tracking/app/credentials/pixel-ops-sa.json
+```
+
+### Enabling on the VPS
+
+After completing the BigQuery setup above, add these lines to `ops/.env` on the
+VPS and restart:
+
+```bash
+OPS_BQ_EXPORT_ENABLED=1
+OPS_BQ_PROJECT_ID=my-gcp-project
+OPS_BQ_DATASET=pixel_ops_logs          # or your chosen name
+OPS_BQ_NGINX_TABLE=nginx_requests
+OPS_BQ_REDIS_TABLE=redis_metrics
+OPS_BQ_EXPORT_INTERVAL_SECONDS=300     # 5-minute buckets
+OPS_BQ_EXPORT_BATCH_SIZE=5000
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/playable_tracking/app/credentials/pixel-ops-sa.json
+OPS_NGINX_CONTAINER=playable_tracking-nginx-1
+OPS_NGINX_ACCESS_LOG_PATH=/var/log/nginx/access.log
+OPS_REDIS_CONTAINER=playable_tracking-redis-1
+OPS_REDIS_QUEUE_KEY=pixel:events
+```
+
+Then restart ops:
+
+```bash
+set -a; . ops/.env; set +a
+bash ops/bin/ops-start.sh
+bash ops/bin/ops-status.sh
+```
+
+`ops-status.sh` (and `ops-status.sh json`) will show a `bq_export` block once
+`OPS_BQ_EXPORT_ENABLED=1`. The deploy-gate (`ops-status.sh gate`) includes
+exporter health in its exit code only when the feature is enabled.
+
+### Keeping it disabled safely
+
+`OPS_BQ_EXPORT_ENABLED=0` (the default) is a hard off-switch:
+
+- The `bq-export-loop.sh` daemon is never started by `ops-start.sh`.
+- `ops-status.sh` shows `bq_export: disabled` — no missing-daemon alert.
+- The deploy gate (`ops-status.sh gate`) ignores the exporter entirely.
+- No BigQuery API calls are ever made; no credentials are required.
+- The other three daemons (monitor, logcollector, capacity) are unaffected.
+
+If you enable the exporter and later want to turn it off, set
+`OPS_BQ_EXPORT_ENABLED=0` in `ops/.env` and run `bash ops/bin/ops-stop.sh` to
+kill the exporter loop process.
+
+### Privacy controls
+
+All four privacy vars default to the safest setting:
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `OPS_LOG_HASH_IP` | `1` | Replace client IP with `SHA-256(<ip>)` before export |
+| `OPS_LOG_INCLUDE_QUERY` | `1` | Include query-string (needed for campaign/platform columns) |
+| `OPS_LOG_QUERY_ALLOWLIST` | `"event game source campaign platform"` | Only these param names are kept; all others are dropped |
+| `OPS_LOG_DROP_HEADERS` | `1` | Strip `User-Agent`, `Referer`, `Cookie` before upload |
+
+To maximise privacy (at the cost of less analytical detail):
+
+```bash
+OPS_LOG_HASH_IP=1
+OPS_LOG_INCLUDE_QUERY=0     # drop entire query-string
+OPS_LOG_DROP_HEADERS=1
+```
+
+To maximise analytics (full query + unhashed IP — only appropriate if legally
+permitted in your jurisdiction):
+
+```bash
+OPS_LOG_HASH_IP=0
+OPS_LOG_INCLUDE_QUERY=1
+OPS_LOG_QUERY_ALLOWLIST=""  # keep all params
+OPS_LOG_DROP_HEADERS=0
+```
+
+### Example BigQuery queries
+
+```sql
+-- Requests per day and hour
+SELECT
+  event_date,
+  EXTRACT(HOUR FROM timestamp) AS hour,
+  COUNT(*)                      AS requests
+FROM `<project>.<dataset>.nginx_requests`
+WHERE event_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) AND CURRENT_DATE()
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+-- Error rate by HTTP status (last 24 h)
+SELECT
+  status,
+  COUNT(*) AS n,
+  ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM `<project>.<dataset>.nginx_requests`
+WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+GROUP BY status
+ORDER BY n DESC;
+
+-- p.gif pixel-event volume by day
+SELECT
+  event_date,
+  COUNT(*) AS pixel_hits
+FROM `<project>.<dataset>.nginx_requests`
+WHERE uri LIKE '/p.gif%'
+GROUP BY 1
+ORDER BY 1 DESC
+LIMIT 30;
+
+-- Top campaign and platform (last 7 days)
+SELECT
+  JSON_VALUE(query_params, '$.campaign') AS campaign,
+  JSON_VALUE(query_params, '$.platform') AS platform,
+  COUNT(*) AS hits
+FROM `<project>.<dataset>.nginx_requests`
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+  AND uri LIKE '/p.gif%'
+GROUP BY 1, 2
+ORDER BY 3 DESC
+LIMIT 20;
+
+-- Redis queue depth over time (last 48 h)
+SELECT
+  TIMESTAMP_TRUNC(timestamp, MINUTE) AS minute,
+  AVG(depth)                          AS avg_depth,
+  MAX(depth)                          AS max_depth
+FROM `<project>.<dataset>.redis_metrics`
+WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+GROUP BY 1
+ORDER BY 1;
+
+-- 5xx rate vs Redis backlog correlation (15-minute buckets)
+WITH
+  nginx AS (
+    SELECT
+      TIMESTAMP_TRUNC(timestamp, MINUTE) AS t,
+      COUNTIF(status >= 500)             AS errors_5xx,
+      COUNT(*)                           AS total
+    FROM `<project>.<dataset>.nginx_requests`
+    WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+    GROUP BY 1
+  ),
+  redis AS (
+    SELECT
+      TIMESTAMP_TRUNC(timestamp, MINUTE) AS t,
+      AVG(depth)                          AS avg_depth
+    FROM `<project>.<dataset>.redis_metrics`
+    WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+    GROUP BY 1
+  )
+SELECT
+  n.t,
+  n.errors_5xx,
+  n.total,
+  ROUND(100.0 * n.errors_5xx / NULLIF(n.total, 0), 2) AS error_rate_pct,
+  r.avg_depth AS redis_depth
+FROM nginx n
+JOIN redis r USING (t)
+ORDER BY t;
+```
+
+### Custom nginx `log_format` for `request_time` and `request_id`
+
+By default, nginx's `combined` format does not include `$request_time` (latency
+in seconds) or a per-request correlation ID. Add this `log_format` block to your
+nginx config before the `server {}` block:
+
+```nginx
+log_format ops_json escape=json
+  '{'
+    '"time":"$time_iso8601",'
+    '"method":"$request_method",'
+    '"uri":"$request_uri",'
+    '"status":$status,'
+    '"bytes":$body_bytes_sent,'
+    '"request_time":$request_time,'
+    '"request_id":"$request_id",'
+    '"remote_addr":"$remote_addr"'
+  '}';
+
+access_log /var/log/nginx/access.log ops_json;
+```
+
+Then set `OPS_NGINX_ACCESS_LOG_PATH=/var/log/nginx/access.log` (or whatever path
+you mount) and `OPS_BQ_EXPORT_ENABLED=1`. The exporter detects the JSON format
+automatically and maps `request_time` → `request_time` and `request_id` →
+`request_id` in the BigQuery row. Without this format the fields are empty but
+all other columns still populate normally.
+
 ## Notes
 
 - Redis runs without persistence in prod, so the on-disk NDJSON queue under

@@ -372,9 +372,16 @@ reconcile_daemon() {
 #   name | pidfile | expected_script | heartbeat_file | max_age_s | start_cmd
 # max_age_s is generous (>= a few loop intervals) to avoid restart thrash:
 #   monitor ~30s, logcollector ~60s, capacity heartbeats each ~300s poll.
+#   bq-export: interval 300s * 2 + buffer = 660s (matches capacity convention).
+# The bq-export-loop row is emitted ONLY when OPS_BQ_EXPORT_ENABLED=1 so that
+# ops-start/stop/status auto-include it without any hardcoded conditionals there.
+# load_ops_env (called above at module load) ensures OPS_BQ_EXPORT_ENABLED is set.
 ops_daemon_rows() {
     printf '%s\n' \
 "monitor-loop|$STATUS_DIR/monitor-loop.pid|monitor-loop.sh|$STATUS_DIR/monitor.heartbeat|${MONITOR_MAX_AGE:-120}|bash $OPS_DIR/bin/monitor-loop.sh" \
 "logcollector-loop|$STATUS_DIR/logcollector-loop.pid|logcollector-loop.sh|$STATUS_DIR/logcollector.heartbeat|${LOGCOLLECT_MAX_AGE:-180}|bash $OPS_DIR/bin/logcollector-loop.sh" \
 "capacity-loop|$STATUS_DIR/capacity-loop.pid|capacity-loop.sh|$STATUS_DIR/loadtester.heartbeat|${CAPACITY_MAX_AGE:-660}|bash $OPS_DIR/bin/capacity-loop.sh"
+    if [ "${OPS_BQ_EXPORT_ENABLED:-0}" = "1" ]; then
+        printf '%s\n' "bq-exporter-loop|$STATUS_DIR/bq-exporter-loop.pid|bq-exporter-loop.sh|$STATUS_DIR/bq-export.heartbeat|${BQ_EXPORT_MAX_AGE:-660}|bash $OPS_DIR/bin/bq-exporter-loop.sh"
+    fi
 }

@@ -23,6 +23,28 @@
 #   OPS_REDIS_QUEUE_KEY        Redis stream/list key for queue-depth reporting
 #                              (default: pixel:events)
 #
+# ── Optional BigQuery log-export secrets (leave unset to keep exporter OFF) ──
+#
+#   OPS_BQ_EXPORT_ENABLED      Set to "1" to activate the log exporter on VPS.
+#                              Default is "0" (off).  The deploy gate only checks
+#                              exporter health when this is "1".
+#   OPS_BQ_PROJECT_ID          GCP project ID that owns the BigQuery dataset
+#   OPS_BQ_DATASET             BigQuery dataset name (default: pixel_ops_logs)
+#   OPS_BQ_NGINX_TABLE         nginx requests table  (default: nginx_requests)
+#   OPS_BQ_REDIS_TABLE         Redis metrics table   (default: redis_metrics)
+#   OPS_BQ_EXPORT_INTERVAL_SECONDS   Export cadence in seconds (default: 300)
+#   OPS_BQ_EXPORT_BATCH_SIZE   Rows per BigQuery insert batch (default: 5000)
+#   OPS_BQ_CREATE_TABLES       "1" = create partitioned tables if missing (default: 0)
+#
+#   NOTE: The service-account key (GOOGLE_APPLICATION_CREDENTIALS path) is a
+#   VPS-local file seeded once by hand — it is NEVER stored in GitHub Secrets
+#   and NEVER printed or echoed by CI.  Store the JSON file on the VPS and set
+#   GOOGLE_APPLICATION_CREDENTIALS in ops/.env by hand (see ops/README.md).
+#
+#   Privacy vars (OPS_LOG_HASH_IP, OPS_LOG_INCLUDE_QUERY,
+#   OPS_LOG_QUERY_ALLOWLIST, OPS_LOG_DROP_HEADERS) may also be stored as GitHub
+#   Variables (not Secrets) and injected below when non-empty.
+#
 # ── One-time manual pre-requisite (NOT a GitHub Secret, NOT in CI) ────────────
 #
 #   The BigQuery service-account key must be present on the VPS at:
@@ -122,6 +144,12 @@ jobs:
       # default).  Optional secrets OPS_DOCKER_COMPOSE_PROJECT / OPS_REDIS_QUEUE_KEY
       # are injected as env overrides when non-empty — absent means auto-detect.
       #
+      # BigQuery log export: all OPS_BQ_* vars are injected from GitHub
+      # Secrets / Variables when non-empty.  The exporter is OFF by default
+      # (OPS_BQ_EXPORT_ENABLED=0) — CI never force-enables it.
+      # GOOGLE_APPLICATION_CREDENTIALS is a VPS-local path set once by hand in
+      # ops/.env; it is NEVER read from GitHub Secrets and NEVER printed.
+      #
       # No load test runs here: CAPACITY_ENABLED / LOADTEST_ENABLED default to 0 in
       # ops/.env.example; the capacity daemon only heartbeats/polls and never stresses
       # unless an operator manually enables it (see ops/README.md).
@@ -141,11 +169,40 @@ jobs:
                printf "PIXEL_BASE=%s\n" "${_base:-http://127.0.0.1:9000}" > ops/.env
              fi
              set -a; . ops/.env; set +a
-             # CI-injected optional overrides (empty secret → ignored → auto-detect).
+             # CI-injected optional overrides (empty secret/var → ignored → auto-detect).
              _proj="${{ secrets.OPS_DOCKER_COMPOSE_PROJECT }}"
              [ -n "$_proj" ] && export OPS_DOCKER_COMPOSE_PROJECT="$_proj"
              _rqk="${{ secrets.OPS_REDIS_QUEUE_KEY }}"
              [ -n "$_rqk" ] && export OPS_REDIS_QUEUE_KEY="$_rqk"
+             # BigQuery log-export overrides — only injected when the GitHub
+             # Secret/Variable is non-empty; GOOGLE_APPLICATION_CREDENTIALS is
+             # intentionally excluded (VPS-local file, never a CI secret).
+             _bqen="${{ vars.OPS_BQ_EXPORT_ENABLED }}"
+             [ -n "$_bqen" ] && export OPS_BQ_EXPORT_ENABLED="$_bqen"
+             _bqp="${{ secrets.OPS_BQ_PROJECT_ID }}"
+             [ -n "$_bqp" ] && export OPS_BQ_PROJECT_ID="$_bqp"
+             _bqds="${{ vars.OPS_BQ_DATASET }}"
+             [ -n "$_bqds" ] && export OPS_BQ_DATASET="$_bqds"
+             _bqnt="${{ vars.OPS_BQ_NGINX_TABLE }}"
+             [ -n "$_bqnt" ] && export OPS_BQ_NGINX_TABLE="$_bqnt"
+             _bqrt="${{ vars.OPS_BQ_REDIS_TABLE }}"
+             [ -n "$_bqrt" ] && export OPS_BQ_REDIS_TABLE="$_bqrt"
+             _bqiv="${{ vars.OPS_BQ_EXPORT_INTERVAL_SECONDS }}"
+             [ -n "$_bqiv" ] && export OPS_BQ_EXPORT_INTERVAL_SECONDS="$_bqiv"
+             _bqbs="${{ vars.OPS_BQ_EXPORT_BATCH_SIZE }}"
+             [ -n "$_bqbs" ] && export OPS_BQ_EXPORT_BATCH_SIZE="$_bqbs"
+             _bqct="${{ vars.OPS_BQ_CREATE_TABLES }}"
+             [ -n "$_bqct" ] && export OPS_BQ_CREATE_TABLES="$_bqct"
+             # Privacy vars (non-sensitive — stored as GitHub Variables, not Secrets).
+             _hi="${{ vars.OPS_LOG_HASH_IP }}"
+             [ -n "$_hi" ] && export OPS_LOG_HASH_IP="$_hi"
+             _iq="${{ vars.OPS_LOG_INCLUDE_QUERY }}"
+             [ -n "$_iq" ] && export OPS_LOG_INCLUDE_QUERY="$_iq"
+             _qa="${{ vars.OPS_LOG_QUERY_ALLOWLIST }}"
+             [ -n "$_qa" ] && export OPS_LOG_QUERY_ALLOWLIST="$_qa"
+             _dh="${{ vars.OPS_LOG_DROP_HEADERS }}"
+             [ -n "$_dh" ] && export OPS_LOG_DROP_HEADERS="$_dh"
              bash ops/bin/ops-start.sh
              sleep 8
+             # Gate: core 3 daemons always checked; exporter health only when enabled.
              bash ops/bin/ops-status.sh gate'

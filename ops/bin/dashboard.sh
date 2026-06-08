@@ -31,6 +31,8 @@ MON_CMD="while true; do clear; printf 'PIXEL TARGET: $PIXEL_BASE\n\n'; \
  bash '$BIN/ops-status.sh' table 2>/dev/null || echo 'ops-status unavailable'; \
  printf '\n== DOCKER HEALTH ==\n'; \
  bash '$BIN/ops-status.sh' docker 2>/dev/null || echo 'docker block unavailable'; \
+ printf '\n== BIGQUERY LOG EXPORT ==\n'; \
+ bash '$BIN/ops-status.sh' bq 2>/dev/null || echo 'bq block unavailable'; \
  printf '\n== MONITOR (latest snapshot, truncated) ==\n'; \
  if [ -f '$STATUS_DIR/monitor-latest.json' ]; then python3 -m json.tool '$STATUS_DIR/monitor-latest.json' 2>/dev/null | grep -vE '^[[:space:]]*[{}][,]?\$' | head -16; else echo 'no snapshot yet — monitor not run'; fi; \
  sleep $REFRESH; done"
