@@ -26,7 +26,8 @@ LOGS_CMD="while true; do clear; printf '== BACKEND LOGS / ERROR ROLLUP ==\n\n'; 
  echo; echo '-- logcollector loop --'; tail -n 4 '$LOGS_DIR/logcollector-loop.out' 2>/dev/null; \
  sleep $REFRESH; done"
 
-MON_CMD="while true; do clear; printf '== DAEMON HEALTH ==\n'; \
+MON_CMD="while true; do clear; printf 'PIXEL TARGET: $PIXEL_BASE\n\n'; \
+ printf '== DAEMON HEALTH ==\n'; \
  bash '$BIN/ops-status.sh' table 2>/dev/null || echo 'ops-status unavailable'; \
  printf '\n== DOCKER HEALTH ==\n'; \
  bash '$BIN/ops-status.sh' docker 2>/dev/null || echo 'docker block unavailable'; \

@@ -125,15 +125,31 @@ PIXEL_JSON="{\"url\":$(json_str "$PIXEL_PROBE_URL"),\"http_code\":$(json_str "$P
 [ -n "$PIXEL_NOTE" ] && PIXEL_JSON="${PIXEL_JSON},\"note\":$(json_str "$PIXEL_NOTE")"
 PIXEL_JSON="${PIXEL_JSON}}"
 
-# --- Docker access classification (shared, read-only) ---
-read DOCKER_AVAIL DOCKER_PERM DOCKER_STATE <<<"$(docker_access)"
+# --- Docker discovery (shared, read-only; DOCKER_STATE feeds the Redis section) ---
+# ops_docker_discover echoes one JSON line with: available, permission_ok, state,
+# discovery_mode, expected_configured, compose_project, prefixes[], multiple_projects[],
+# expected[] (gated container names), all_visible[].
+DISC_JSON="$(ops_docker_discover 2>/dev/null || echo '{"available":false,"permission_ok":false,"state":"no_cli","discovery_mode":"unavailable","expected_configured":false,"compose_project":"","prefixes":[],"multiple_projects":[],"expected":[],"all_visible":[]}')"
+DOCKER_STATE="$(printf '%s' "$DISC_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state","no_cli"))' 2>/dev/null || echo 'no_cli')"
 
-# --- Redis queue depth (host redis-cli first, docker exec fallback) ---
-REDIS_KEY="${OPS_REDIS_QUEUE_KEY:-$REDIS_STREAM}"
+# --- Redis queue depth ---
+# Priority chain:
+#   (A) host redis-cli connects and returns depth -> status ok, method host_cli
+#   (B) OPS_REDIS_CONTAINER + OPS_REDIS_QUEUE_KEY both set -> docker exec -> status ok/error
+#   (C) ops_redis_detect auto-discovers a container:
+#         if OPS_REDIS_QUEUE_KEY set -> docker exec -> status ok/error
+#         else                       -> status queue_key_not_configured
+#   (D) nothing reachable            -> status not_configured
+# Configured-but-unreadable paths set REDIS_ALERT=1.
+REDIS_CONFIGURED_KEY="${OPS_REDIS_QUEUE_KEY:-}"
 REDIS_CONTAINER="${OPS_REDIS_CONTAINER:-}"
 REDIS_METHOD=""
 REDIS_DEPTH=""
-REDIS_OK=0
+REDIS_STATUS="not_configured"
+REDIS_ALERT=0
+REDIS_DETAIL=""
+REDIS_HOST_CLI=0
+DETECTED_REDIS_CONTAINER=""
 
 # redis_query <redis-cli invocation...> — echo depth of REDIS_KEY (stream XLEN
 # first, list LLEN fallback) or empty on failure. Read-only commands only.
@@ -148,34 +164,82 @@ redis_query() {
     printf '%s' "$d"
 }
 
-REDIS_HOST_CLI=0
+# Initial REDIS_KEY: operator-configured key or fall back to the stream name.
+REDIS_KEY="${REDIS_CONFIGURED_KEY:-${REDIS_STREAM}}"
+
+# (A) host redis-cli
 if command -v redis-cli >/dev/null 2>&1; then
     REDIS_HOST_CLI=1
     REDIS_ARGS=(redis-cli)
     [ -n "${REDIS_URL:-}" ] && REDIS_ARGS=(redis-cli -u "$REDIS_URL")
     REDIS_DEPTH="$(redis_query "${REDIS_ARGS[@]}")"
-    [ -n "$REDIS_DEPTH" ] && { REDIS_METHOD="host_cli"; REDIS_OK=1; }
-fi
-if [ "$REDIS_OK" = "0" ] && [ -n "$REDIS_CONTAINER" ] && [ "$DOCKER_STATE" = "ok" ]; then
-    REDIS_DEPTH="$(redis_query docker exec "$REDIS_CONTAINER" redis-cli)"
-    if [ -n "$REDIS_DEPTH" ]; then REDIS_METHOD="docker_exec"; REDIS_OK=1; fi
+    if [ -n "$REDIS_DEPTH" ]; then
+        REDIS_STATUS="ok"
+        REDIS_METHOD="host_cli"
+    else
+        REDIS_STATUS="error"
+        REDIS_ALERT=1
+        REDIS_DETAIL="redis-cli on PATH but queue depth unreadable (key ${REDIS_KEY})"
+    fi
 fi
 
-REDIS_ALERT=0; REDIS_DETAIL=""
-if [ "$REDIS_OK" = "1" ]; then
+# (B) OPS_REDIS_CONTAINER + OPS_REDIS_QUEUE_KEY both explicitly configured
+if [ "$REDIS_STATUS" = "not_configured" ] && \
+   [ -n "$REDIS_CONTAINER" ] && [ -n "$REDIS_CONFIGURED_KEY" ] && \
+   [ "$DOCKER_STATE" = "ok" ]; then
+    REDIS_KEY="$REDIS_CONFIGURED_KEY"
+    REDIS_DEPTH="$(redis_query docker exec "$REDIS_CONTAINER" redis-cli)"
+    if [ -n "$REDIS_DEPTH" ]; then
+        REDIS_STATUS="ok"
+        REDIS_METHOD="docker_exec"
+    else
+        REDIS_STATUS="error"
+        REDIS_ALERT=1
+        REDIS_DETAIL="OPS_REDIS_CONTAINER+OPS_REDIS_QUEUE_KEY set but docker exec redis-cli failed (container=${REDIS_CONTAINER}, key=${REDIS_KEY})"
+    fi
+fi
+
+# (C) ops_redis_detect auto-discovery fallback
+if [ "$REDIS_STATUS" = "not_configured" ]; then
+    DETECTED_REDIS_CONTAINER="$(ops_redis_detect 2>/dev/null || true)"
+    if [ -n "$DETECTED_REDIS_CONTAINER" ]; then
+        if [ -n "$REDIS_CONFIGURED_KEY" ] && [ "$DOCKER_STATE" = "ok" ]; then
+            REDIS_KEY="$REDIS_CONFIGURED_KEY"
+            REDIS_DEPTH="$(redis_query docker exec "$DETECTED_REDIS_CONTAINER" redis-cli)"
+            if [ -n "$REDIS_DEPTH" ]; then
+                REDIS_STATUS="ok"
+                REDIS_METHOD="docker_exec"
+                REDIS_CONTAINER="$DETECTED_REDIS_CONTAINER"
+            else
+                REDIS_STATUS="error"
+                REDIS_ALERT=1
+                REDIS_DETAIL="auto-detected redis container ${DETECTED_REDIS_CONTAINER} but docker exec redis-cli failed (key=${REDIS_KEY})"
+            fi
+        else
+            # Container found but OPS_REDIS_QUEUE_KEY not set (or docker unavailable)
+            REDIS_STATUS="queue_key_not_configured"
+        fi
+    fi
+fi
+# (D) REDIS_STATUS remains "not_configured" when none of the above succeeded.
+
+USED_REDIS_CONTAINER="${REDIS_CONTAINER:-${DETECTED_REDIS_CONTAINER:-}}"
+if [ "$REDIS_STATUS" = "ok" ]; then
+    REDIS_DETAIL="redis depth ${REDIS_DEPTH} (key ${REDIS_KEY}) via ${REDIS_METHOD}"
     if [ "$REDIS_METHOD" = "docker_exec" ]; then
-        REDIS_JSON="{\"status\":\"ok\",\"method\":\"docker_exec\",\"container\":$(json_str "$REDIS_CONTAINER"),\"queue_key\":$(json_str "$REDIS_KEY"),\"depth\":${REDIS_DEPTH}}"
+        REDIS_JSON="{\"status\":\"ok\",\"method\":\"docker_exec\",\"container\":$(json_str "$USED_REDIS_CONTAINER"),\"queue_key\":$(json_str "$REDIS_KEY"),\"depth\":${REDIS_DEPTH}}"
     else
         REDIS_JSON="{\"status\":\"ok\",\"method\":\"host_cli\",\"queue_key\":$(json_str "$REDIS_KEY"),\"depth\":${REDIS_DEPTH}}"
     fi
-    REDIS_DETAIL="redis depth ${REDIS_DEPTH} (key ${REDIS_KEY}) via ${REDIS_METHOD}"
-elif [ -n "$REDIS_CONTAINER" ] || [ "$REDIS_HOST_CLI" = "1" ]; then
-    # Configured (a container named or host cli present) but unreadable -> alert.
-    REDIS_JSON="{\"status\":\"error\",\"method\":$(json_str "${REDIS_METHOD:-none}"),\"container\":$(json_str "$REDIS_CONTAINER"),\"queue_key\":$(json_str "$REDIS_KEY"),\"message\":\"redis configured but queue depth unreadable (daemon down, wrong key, or docker exec denied)\"}"
-    REDIS_ALERT=1
-    REDIS_DETAIL="redis configured (key ${REDIS_KEY}, container '${REDIS_CONTAINER:-none}') but depth unreadable"
+elif [ "$REDIS_STATUS" = "error" ]; then
+    [ -z "$REDIS_DETAIL" ] && REDIS_DETAIL="redis configured but queue depth unreadable"
+    REDIS_JSON="{\"status\":\"error\",\"method\":$(json_str "${REDIS_METHOD:-none}"),\"container\":$(json_str "$USED_REDIS_CONTAINER"),\"queue_key\":$(json_str "$REDIS_KEY"),\"message\":$(json_str "$REDIS_DETAIL")}"
+elif [ "$REDIS_STATUS" = "queue_key_not_configured" ]; then
+    REDIS_JSON="{\"status\":\"queue_key_not_configured\",\"container\":$(json_str "${DETECTED_REDIS_CONTAINER}"),\"message\":\"Set OPS_REDIS_QUEUE_KEY to enable Redis depth checks\"}"
+    REDIS_DETAIL="redis container auto-detected (${DETECTED_REDIS_CONTAINER}) but OPS_REDIS_QUEUE_KEY not set"
 else
-    REDIS_JSON="{\"status\":\"not_configured\",\"message\":\"Set OPS_REDIS_CONTAINER and OPS_REDIS_QUEUE_KEY to enable Redis depth checks\"}"
+    # (D) not_configured
+    REDIS_JSON="{\"status\":\"not_configured\",\"message\":\"Install redis-cli or set OPS_REDIS_CONTAINER and OPS_REDIS_QUEUE_KEY\"}"
     REDIS_DETAIL="redis not configured"
 fi
 
@@ -206,54 +270,81 @@ P_SERVER="$(pcount 'src/server.js')"
 P_WORKER="$(pcount 'src/worker.js')"
 P_DISPATCH="$(pcount 'src/dispatcher.js')"
 
-# --- Docker container health (read-only inspect) ---
-# Configurable via OPS_DOCKER_CONTAINERS; the detailed `docker` section below is
-# the single source of truth (replaces the old hardcoded `grep -c '^pixel-'`).
-# DOCKER_HELPER_OUT carries a "DOCKER\t<json>" line plus "ALERT\t..." lines.
+# --- Docker container health (read-only inspect via ops_docker_discover results) ---
+# Rebuilds the "docker" section from discovery JSON: calls docker inspect per
+# container for state/health/restart_count/started; uses docker ps -a for
+# image/status/ports. Top-level keys: available, permission_ok, discovery_mode,
+# expected_configured, compose_project, prefixes, multiple_projects, containers[].
+# Each container: name, image, state, status, health, restart_count, ports,
+# expected(bool), reason.  Alerts fire ONLY for expected containers that are
+# missing/exited/restarting/healthcheck-unhealthy.  Non-expected all_visible
+# containers are reported but never trigger alerts.
+# DOCKER_HELPER_OUT carries "DOCKER\t<json>" and zero or more "ALERT\t..." lines.
 DOCKER_HELPER_OUT=""
 if [ "$DOCKER_STATE" = "ok" ]; then
-    DOCKER_HELPER_OUT="$(OPS_DOCKER_CONTAINERS="${OPS_DOCKER_CONTAINERS:-}" python3 - <<'PY' 2>/dev/null || true
+    DOCKER_HELPER_OUT="$(DISC_JSON="$DISC_JSON" python3 - <<'PY' 2>/dev/null || true
 import json, os, subprocess
 
-expected = os.environ.get("OPS_DOCKER_CONTAINERS", "").split()
+disc = json.loads(os.environ["DISC_JSON"])
+expected_set = set(disc.get("expected", []))
+all_visible  = disc.get("all_visible", [])
+
+# Inspect order: expected first, then non-expected all_visible
+inspect_names = list(disc.get("expected", []))
+for n in all_visible:
+    if n not in expected_set:
+        inspect_names.append(n)
 
 def d(*args):
     try:
-        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=8)
+        return subprocess.run(["docker"] + list(args), capture_output=True, text=True, timeout=8)
     except Exception:
-        class R:  # mimic a failed run
+        class R:
             returncode = 1; stdout = ""; stderr = ""
         return R()
 
+# Single docker ps -a pass for image / status / ports
 psmap = {}
 ps = d("ps", "-a", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}")
 if ps.returncode == 0:
     for line in ps.stdout.splitlines():
         p = line.split("\t")
-        if len(p) >= 4:
-            psmap[p[0]] = {"image": p[1], "status": p[2], "ports": p[3] or "-"}
+        if len(p) >= 1:
+            psmap[p[0]] = {
+                "image":  p[1] if len(p) > 1 else "",
+                "status": p[2] if len(p) > 2 else "",
+                "ports":  p[3] if len(p) > 3 else "-",
+            }
 
-names = expected if expected else sorted(psmap.keys())
 containers = []
 alerts = []
-for n in names:
-    info = psmap.get(n)
-    if info is None:
-        containers.append({"name": n, "present": False, "state": "missing",
-                           "health": "n/a", "restarts": None, "ports": "-", "reason": "container not found"})
-        if expected:
+
+for n in inspect_names:
+    is_expected = n in expected_set
+    ps_info = psmap.get(n)
+
+    if ps_info is None:
+        # Not in docker ps -a — container missing
+        containers.append({
+            "name": n, "image": "", "state": "missing", "status": "missing",
+            "health": "n/a", "restart_count": None, "ports": "-",
+            "expected": is_expected, "reason": "container not found",
+        })
+        if is_expected:
             alerts.append((n, 1, "error", "expected container %s not found" % n))
         continue
-    state = health = "n/a"; restarts = None; started = ""
+
+    # docker inspect for state / health / restart_count / started
+    state = "n/a"; health = "n/a"; restart_count = None
     insp = d("inspect", "--format",
              "{{.State.Status}}\t{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}\t{{.RestartCount}}\t{{.State.StartedAt}}", n)
     if insp.returncode == 0:
         f = insp.stdout.strip().split("\t")
-        state = f[0] if len(f) > 0 and f[0] else "n/a"
-        health = f[1] if len(f) > 1 and f[1] else "n/a"
-        try: restarts = int(f[2])
-        except Exception: restarts = None
-        started = f[3] if len(f) > 3 else ""
+        if len(f) > 0 and f[0]: state = f[0]
+        if len(f) > 1 and f[1]: health = f[1]
+        try: restart_count = int(f[2]) if len(f) > 2 else None
+        except Exception: pass
+
     reason = "ok"; bad = False
     if state in ("exited", "dead"):
         bad = True; reason = "container %s" % state
@@ -261,25 +352,59 @@ for n in names:
         bad = True; reason = "restarting"
     elif health == "unhealthy":
         bad = True; reason = "healthcheck unhealthy"
-    elif state != "running":
+    elif state not in ("running", "n/a"):
         reason = state
-    containers.append({"name": n, "present": True, "image": info["image"], "state": state,
-                       "health": health, "restarts": restarts, "ports": info["ports"],
-                       "status": info["status"], "started": started, "reason": reason})
-    if expected:
+
+    containers.append({
+        "name":          n,
+        "image":         ps_info["image"],
+        "state":         state,
+        "status":        ps_info["status"],
+        "health":        health,
+        "restart_count": restart_count,
+        "ports":         ps_info["ports"] or "-",
+        "expected":      is_expected,
+        "reason":        reason,
+    })
+    # Alerts only for expected containers; non-expected (all_visible) never fail health
+    if is_expected:
         alerts.append((n, 1 if bad else 0, "error", reason))
 
-obj = {"available": True, "permission_ok": True,
-       "expected_configured": bool(expected), "containers": containers}
+obj = {
+    "available":           disc.get("available", False),
+    "permission_ok":       disc.get("permission_ok", False),
+    "discovery_mode":      disc.get("discovery_mode", "unavailable"),
+    "expected_configured": disc.get("expected_configured", False),
+    "compose_project":     disc.get("compose_project", ""),
+    "prefixes":            disc.get("prefixes", []),
+    "multiple_projects":   disc.get("multiple_projects", []),
+    "containers":          containers,
+}
 print("DOCKER\t" + json.dumps(obj))
 for (n, active, sev, detail) in alerts:
     print("ALERT\t%s\t%d\t%s\t%s" % (n, active, sev, detail))
 PY
 )"
     DOCKER_JSON="$(printf '%s\n' "$DOCKER_HELPER_OUT" | sed -n 's/^DOCKER\t//p')"
-    [ -z "$DOCKER_JSON" ] && DOCKER_JSON="{\"available\":true,\"permission_ok\":true,\"containers\":[],\"status\":\"docker_inspect_failed\"}"
+    if [ -z "$DOCKER_JSON" ]; then
+        # Python block failed — surface discovery info with an error flag
+        DOCKER_JSON="$(printf '%s' "$DISC_JSON" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+out={k:d.get(k) for k in ["available","permission_ok","discovery_mode","expected_configured","compose_project","prefixes","multiple_projects"]}
+out["containers"]=[]; out["status"]="docker_inspect_failed"
+print(json.dumps(out))
+' 2>/dev/null || echo '{"available":true,"permission_ok":true,"containers":[],"status":"docker_inspect_failed"}')"
+    fi
 else
-    DOCKER_JSON="{\"available\":${DOCKER_AVAIL},\"permission_ok\":false,\"status\":\"docker_missing_or_permission_denied\",\"state\":$(json_str "$DOCKER_STATE")}"
+    # Docker unavailable or permission denied — pass discovery info through directly
+    DOCKER_JSON="$(printf '%s' "$DISC_JSON" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+out={k:d.get(k) for k in ["available","permission_ok","state","discovery_mode","expected_configured","compose_project","prefixes","multiple_projects"]}
+out["containers"]=[]
+print(json.dumps(out))
+' 2>/dev/null || echo '{"available":false,"permission_ok":false,"containers":[]}')"
 fi
 
 # --- System ---

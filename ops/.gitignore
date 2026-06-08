@@ -1,4 +1,6 @@
-# Only the ops code is tracked (bin/, lib/, tests/, README.md).
+# Only the ops code is tracked (bin/, lib/, tests/, README.md, .env.example).
+# ops/.env holds local secrets/overrides — commit only .env.example, never .env.
+.env
 # Everything below is runtime / generated state produced by the daemons.
 logs/
 status/

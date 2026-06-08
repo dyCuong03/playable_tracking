@@ -77,6 +77,94 @@ set -a; . ops/.env; set +a      # export everything
 bash ops/bin/ops-start.sh
 ```
 
+## Minimal config after deploy
+
+After the first `git pull` + `./scripts/deploy-prod.sh`, create `ops/.env` **once**
+on the VPS.  The file is gitignored and survives every redeploy.  `ops-start.sh`
+sources it automatically; CI never overwrites it.
+
+**Setup A — same VPS, one Docker Compose project (most common)**
+
+```bash
+cat > ops/.env <<'EOF'
+PIXEL_BASE=http://127.0.0.1:9000
+OPS_DOCKER_COMPOSE_PROJECT=playable_tracking   # compose project name
+OPS_REDIS_QUEUE_KEY=pixel:events               # stream key used by XLEN → LLEN fallback
+EOF
+set -a; . ops/.env; set +a
+bash ops/bin/ops-start.sh
+```
+
+The monitor and logcollector discover all containers whose name starts with the
+compose project (e.g. `playable_tracking-nginx-1`, `playable_tracking-app-1`, …)
+without you having to enumerate them explicitly.  Redis depth is read via
+`docker exec <OPS_REDIS_CONTAINER> redis-cli` — set `OPS_REDIS_CONTAINER` to the
+Redis container name if needed (see `ops/.env.example`).
+
+**Setup B — auto-detect (only PIXEL_BASE, no explicit container list)**
+
+```bash
+echo "PIXEL_BASE=http://127.0.0.1:9000" > ops/.env
+set -a; . ops/.env; set +a
+bash ops/bin/ops-start.sh
+```
+
+Discovery mode: the monitor lists every running container without raising alerts
+for missing names.  Redis depth is skipped unless `OPS_REDIS_CONTAINER` is set.
+
+**Setup C — remote observation node (pixel probe only, no docker/redis)**
+
+```bash
+echo "PIXEL_BASE=https://pixel.example.com" > ops/.env
+# Optionally, provide compose project for informational discovery only:
+# echo "OPS_DOCKER_COMPOSE_PROJECT=playable_tracking" >> ops/.env
+set -a; . ops/.env; set +a
+bash ops/bin/ops-start.sh
+```
+
+HTTP, `/health`, and pixel probes work from any host.  Docker and Redis checks
+only work when `ops/` runs on the **same host** as the Docker daemon — omit those
+vars on a remote box.  View the dashboard by SSHing in; do not expose it publicly.
+
+### Docker permission setup (same-VPS only)
+
+If Docker is installed but `docker ps` fails without `sudo`:
+
+```bash
+sudo usermod -aG docker $USER
+# log out and back in (or: newgrp docker)
+docker ps    # must succeed without sudo
+```
+
+The monitor and logcollector run as the deploy user and degrade silently to
+`permission_denied` if the user is not in the `docker` group.
+*Note: Docker CLI is unavailable or non-functional in some WSL2 distros — this
+is expected; the monitor records `no_cli` / `permission_denied` and continues.*
+
+### Dashboard (local-over-SSH only)
+
+`ops/bin/dashboard.sh` opens a tmux 4-pane window meant to be viewed on the VPS
+console or over SSH — it is **not** exposed over HTTP.  Open it with:
+
+```bash
+ssh user@vps
+cd /path/to/playable_tracking
+bash ops/bin/dashboard.sh   # detach: Ctrl-b d
+```
+
+### Loadtest / capacity
+
+`LOADTEST_ENABLED=0` and `CAPACITY_ENABLED=0` are the defaults and are **never
+changed by CI**.  The capacity daemon heartbeats and polls health, but does not
+stress the target unless an operator explicitly sets `CAPACITY_ENABLED=1` in
+the shell or `ops/.env`.  This keeps every deploy and post-deploy CI step load-free.
+
+### `ops/` is observer-only
+
+`ops/` reads from the server and Docker: `docker ps`, `docker inspect`,
+`docker logs`, `docker exec … redis-cli` (read-only), and HTTP probes.  It
+**never** restarts, recreates, kills, or otherwise mutates application containers.
+
 ## Production visibility (Docker, Redis, pixel)
 
 The pixel server is Docker-deployed, so proving `/health` responds is not enough.

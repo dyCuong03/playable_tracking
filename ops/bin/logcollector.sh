@@ -30,11 +30,7 @@ SUMMARY_FILE="$STATUS_DIR/logcollector-latest.json"
 ALERTS_FILE="$STATUS_DIR/alerts.ndjson"
 ERROR_SPIKE="${ERROR_SPIKE:-20}"
 
-# Operator-declared containers win; otherwise fall back to the known names.
-# CONTAINERS_CONFIGURED records whether the operator explicitly declared them, so
-# the rollup/dashboard can say "expected-containers-not-configured" vs guessing.
-if [ -n "${OPS_DOCKER_CONTAINERS:-}" ]; then CONTAINERS_CONFIGURED=true; else CONTAINERS_CONFIGURED=false; fi
-CONTAINERS="${OPS_DOCKER_CONTAINERS:-pixel-server pixel-worker pixel-dispatcher redis nginx}"
+# Docker log collection tuning — containers determined at runtime via ops_docker_discover.
 DOCKER_SINCE="${LOGCOLLECT_DOCKER_SINCE:-10m}"
 DOCKER_TAIL="${LOGCOLLECT_DOCKER_TAIL:-500}"
 
@@ -148,36 +144,102 @@ collect_incremental "app"               "$REPO_DIR/logs/pixel-tracking.txt"   "$
 collect_incremental "local-server.out"  "$REPO_DIR/logs/local-server.out.log" "$DAYDIR/local-server.out.log"
 collect_incremental "local-server.err"  "$REPO_DIR/logs/local-server.err.log" "$DAYDIR/local-server.err.log"
 
-# ---- 2. container logs ------------------------------------------------------
+# ---- 2. container logs (via ops_docker_discover) ----------------------------
 DOCKER_UNAVAIL="$CONTDIR/_docker-unavailable.log"
 DOCKER_REASONS="$(mktemp)"
+DOCKER_WARNING=""
+DOCKER_WARN_CODE=""
+DOCKER_ZERO_REASON=""
+COLLECT_CONTAINERS=""
+
+# ops_docker_discover provides consistent docker visibility across all ops tools.
+DISCOVER_JSON="$(ops_docker_discover 2>/dev/null || true)"
+_parse_result="$(python3 - "$DISCOVER_JSON" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    d = {}
+b = lambda x: "true" if x else "false"
+print(b(d.get("available")))
+print(b(d.get("permission_ok")))
+print(d.get("state", "unavailable"))
+print(d.get("discovery_mode", "unavailable"))
+print(b(d.get("expected_configured")))
+print(d.get("compose_project", ""))
+print(" ".join(d.get("expected", [])))
+print(" ".join(d.get("all_visible", [])))
+print(" ".join(d.get("multiple_projects", [])))
+PY
+)"
+DOCKER_AVAIL=$(   printf '%s\n' "$_parse_result" | sed -n '1p')
+DOCKER_PERM=$(    printf '%s\n' "$_parse_result" | sed -n '2p')
+DOCKER_STATE=$(   printf '%s\n' "$_parse_result" | sed -n '3p')
+DISCOVERY_MODE=$( printf '%s\n' "$_parse_result" | sed -n '4p')
+EXPECTED_CONFIGURED=$(printf '%s\n' "$_parse_result" | sed -n '5p')
+COMPOSE_PROJECT=$(printf '%s\n' "$_parse_result" | sed -n '6p')
+CONTAINERS=$(     printf '%s\n' "$_parse_result" | sed -n '7p')
+ALL_VISIBLE=$(    printf '%s\n' "$_parse_result" | sed -n '8p')
+# Safety defaults if ops_docker_discover or python3 parse failed.
+DOCKER_AVAIL="${DOCKER_AVAIL:-false}"
+DOCKER_PERM="${DOCKER_PERM:-false}"
+DOCKER_STATE="${DOCKER_STATE:-unavailable}"
+DISCOVERY_MODE="${DISCOVERY_MODE:-unavailable}"
+EXPECTED_CONFIGURED="${EXPECTED_CONFIGURED:-false}"
+# COMPOSE_PROJECT, CONTAINERS, ALL_VISIBLE default empty — fine.
+
 # DOCKER_STATUS is surfaced in the summary + rollup so a bare sources=0 is never
 # mistaken for "all quiet" when docker is actually blocked by permission.
-read DOCKER_AVAIL DOCKER_PERM DOCKER_STATE <<<"$(docker_access)"
 DOCKER_STATUS="$DOCKER_STATE"
-DOCKER_WARNING=""
 # Stable machine token surfaced in rollup + status whenever docker logs could not
-# be collected (no CLI / no daemon / permission denied) — see spec task 4.
-DOCKER_WARN_CODE=""
+# be collected (no CLI / no daemon / permission denied).
 case "$DOCKER_STATE" in ok) ;; *) DOCKER_WARN_CODE="docker_unavailable_or_permission_denied";; esac
 
 if [ "$DOCKER_STATE" = "ok" ]; then
-    present="$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)"
-    for c in $CONTAINERS; do
-        if printf '%s\n' "$present" | grep -qx "$c"; then
-            tmp="$(mktemp)"
-            if docker logs --since "$DOCKER_SINCE" --tail "$DOCKER_TAIL" "$c" > "$tmp" 2>&1; then
-                cat "$tmp" > "$CONTDIR/$c.log"
-                record_source "container:$c" "$tmp" "$GENERIC_ERR_RE" "$GENERIC_WARN_RE"
-            else
-                jlog "warn" "$ROLE" "docker logs failed for container" "{\"container\":$(json_str "$c")}" >> "$DOCKER_REASONS"
-            fi
-            rm -f "$tmp"
+    if [ "$DISCOVERY_MODE" = "all_visible" ] && [ "${OPS_DOCKER_LOG_ALL_VISIBLE:-0}" != "1" ]; then
+        # all_visible mode: skip collection unless the operator explicitly opts in.
+        jlog "info" "$ROLE" "docker log collection skipped in all_visible mode (set OPS_DOCKER_LOG_ALL_VISIBLE=1 to enable)" \
+            "{\"discovery_mode\":\"all_visible\"}" >> "$DOCKER_REASONS"
+        DOCKER_ZERO_REASON="all_visible_mode_skip"
+    else
+        [ "$DISCOVERY_MODE" = "all_visible" ] && COLLECT_CONTAINERS="$ALL_VISIBLE" || COLLECT_CONTAINERS="$CONTAINERS"
+        if [ -z "$COLLECT_CONTAINERS" ]; then
+            DOCKER_ZERO_REASON="no-expected-containers-configured"
+            jlog "warn" "$ROLE" "no containers in expected set - docker logs skipped" \
+                "{\"discovery_mode\":$(json_str "$DISCOVERY_MODE"),\"expected_configured\":$EXPECTED_CONFIGURED}" >> "$DOCKER_REASONS"
         else
-            jlog "warn" "$ROLE" "container absent - skipped" "{\"container\":$(json_str "$c")}" >> "$DOCKER_REASONS"
+            present="$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)"
+            _docker_attempted=0
+            _docker_collected=0
+            _docker_failed=0
+            for c in $COLLECT_CONTAINERS; do
+                _docker_attempted=$((_docker_attempted+1))
+                if printf '%s\n' "$present" | grep -qx "$c"; then
+                    tmp="$(mktemp)"
+                    if docker logs --since "$DOCKER_SINCE" --tail "$DOCKER_TAIL" "$c" > "$tmp" 2>&1; then
+                        cat "$tmp" > "$CONTDIR/$c.log"
+                        record_source "container:$c" "$tmp" "$GENERIC_ERR_RE" "$GENERIC_WARN_RE"
+                        _docker_collected=$((_docker_collected+1))
+                    else
+                        jlog "warn" "$ROLE" "docker logs failed for container" "{\"container\":$(json_str "$c")}" >> "$DOCKER_REASONS"
+                        _docker_failed=$((_docker_failed+1))
+                    fi
+                    rm -f "$tmp"
+                else
+                    jlog "warn" "$ROLE" "container absent - skipped" "{\"container\":$(json_str "$c")}" >> "$DOCKER_REASONS"
+                fi
+            done
+            if [ "$_docker_collected" -eq 0 ] && [ "$_docker_attempted" -gt 0 ]; then
+                if [ "$_docker_failed" -gt 0 ]; then
+                    DOCKER_ZERO_REASON="docker-logs-failed"
+                else
+                    DOCKER_ZERO_REASON="no-matching-containers"
+                fi
+            fi
         fi
-    done
+    fi
 elif [ "$DOCKER_STATE" = "permission_denied" ]; then
+    DOCKER_ZERO_REASON="permission_denied"
     DOCKER_WARNING="docker permission denied — add the deploy user to the docker group (sudo usermod -aG docker \$USER, then re-login) so container logs can be collected."
     jlog "warn" "$ROLE" "docker permission denied - container logs skipped" "{\"reason\":\"permission_denied\"}" >> "$DOCKER_REASONS"
 elif [ "$DOCKER_STATE" = "no_cli" ]; then
@@ -211,9 +273,10 @@ ROLLUP="$DAYDIR/errors-rollup.txt"
 {
     printf '# errors-rollup %s (generated %s)\n' "$DATE" "$(ts_now)"
     printf '# error/warn lines per collected source (last 200 each)\n'
-    printf '# sources_collected=%s  docker_status=%s\n' "${#SRC_NAMES[@]}" "$DOCKER_STATUS"
+    printf '# sources_collected=%s  docker_status=%s  discovery_mode=%s\n' "${#SRC_NAMES[@]}" "$DOCKER_STATUS" "$DISCOVERY_MODE"
     [ -n "$DOCKER_WARN_CODE" ] && printf '# %s: %s\n' "$DOCKER_WARN_CODE" "$DOCKER_WARNING"
-    [ "$CONTAINERS_CONFIGURED" = false ] && printf '# expected-containers-not-configured: set OPS_DOCKER_CONTAINERS to collect container logs\n'
+    [ -n "$DOCKER_ZERO_REASON" ] && printf '# docker_zero_reason: %s\n' "$DOCKER_ZERO_REASON"
+    [ "$EXPECTED_CONFIGURED" = "false" ] && [ "$DISCOVERY_MODE" != "all_visible" ] && printf '# expected-containers-not-configured: set OPS_DOCKER_COMPOSE_PROJECT or OPS_DOCKER_CONTAINERS\n'
     printf '\n'
     shopt -s nullglob
     for f in "$DAYDIR/app.log" "$DAYDIR/local-server.out.log" "$DAYDIR/local-server.err.log" "$CONTDIR"/*.log; do
@@ -241,10 +304,11 @@ for i in "${!SRC_NAMES[@]}"; do
 done
 SOURCES_JSON+="]"
 
-DOCKER_JSON_SUMMARY="{\"status\":$(json_str "$DOCKER_STATUS"),\"available\":${DOCKER_AVAIL},\"permission_ok\":${DOCKER_PERM}"
+DOCKER_JSON_SUMMARY="{\"status\":$(json_str "$DOCKER_STATUS"),\"available\":${DOCKER_AVAIL},\"permission_ok\":${DOCKER_PERM},\"discovery_mode\":$(json_str "$DISCOVERY_MODE"),\"expected_configured\":${EXPECTED_CONFIGURED},\"compose_project\":$(json_str "$COMPOSE_PROJECT")"
 [ -n "$DOCKER_WARNING" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"warning\":$(json_str "$DOCKER_WARNING")"
 [ -n "$DOCKER_WARN_CODE" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"warning_code\":$(json_str "$DOCKER_WARN_CODE")"
-DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"containers_configured\":${CONTAINERS_CONFIGURED},\"containers_watched\":$(json_str "$CONTAINERS")}"
+[ -n "$DOCKER_ZERO_REASON" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"zero_reason\":$(json_str "$DOCKER_ZERO_REASON")"
+DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"containers_configured\":${EXPECTED_CONFIGURED},\"containers_watched\":$(json_str "$CONTAINERS")}"
 
 SUMMARY="{\"ts\":\"$(ts_now)\",\"role\":\"$ROLE\",\"date\":\"$DATE\",\"sources\":$SOURCES_JSON,\"source_count\":${#SRC_NAMES[@]},\"total_errors\":$TOTAL_ERR,\"total_warns\":$TOTAL_WARN,\"docker\":$DOCKER_JSON_SUMMARY}"
 printf '%s\n' "$SUMMARY" > "$SUMMARY_FILE"

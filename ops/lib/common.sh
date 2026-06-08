@@ -8,6 +8,28 @@ REPORTS_DIR="$OPS_DIR/reports"
 LOGS_DIR="$OPS_DIR/logs"
 mkdir -p "$STATUS_DIR" "$REPORTS_DIR" "$LOGS_DIR"
 
+# ---------------------------------------------------------------------------
+# Environment loader (idempotent). Sources $OPS_DIR/.env then $REPO_DIR/.env.ops
+# if present, each via `set -a; . "$f"; set +a` so every variable in the file is
+# exported. Called here — BEFORE any :- defaults — so file values win and the
+# defaults only fill remaining gaps. Subsequent calls are no-ops.
+# ---------------------------------------------------------------------------
+_OPS_ENV_LOADED=0
+load_ops_env() {
+    [ "${_OPS_ENV_LOADED:-0}" = "1" ] && return 0
+    local f
+    for f in "$OPS_DIR/.env" "$REPO_DIR/.env.ops"; do
+        if [ -f "$f" ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . "$f"
+            set +a
+        fi
+    done 2>/dev/null || true
+    _OPS_ENV_LOADED=1
+}
+load_ops_env
+
 PIXEL_BASE="${PIXEL_BASE:-http://127.0.0.1:9000}"
 HEALTH_URL="${HEALTH_URL:-${PIXEL_BASE}/health}"
 PIXEL_URL="${PIXEL_URL:-${PIXEL_BASE}/p.gif}"
@@ -69,6 +91,142 @@ docker_access() {
 # monitor runs in discovery-only mode (lists what is present, never fails
 # health on a missing name).
 ops_docker_expected() { printf '%s' "${OPS_DOCKER_CONTAINERS:-}"; }
+
+# ---------------------------------------------------------------------------
+# ops_docker_discover() — READ-ONLY container discovery.
+# Echoes ONE JSON object line with keys:
+#   available(bool)  permission_ok(bool)  state(string)
+#   discovery_mode("explicit|compose|compose_auto|prefix|all_visible|unavailable")
+#   expected_configured(bool)  compose_project(string)  prefixes(array)
+#   multiple_projects(array)   expected(array)           all_visible(array)
+#
+# Mode priority: explicit > compose > compose_auto > prefix > all_visible.
+#   explicit     OPS_DOCKER_CONTAINERS is set
+#   compose      OPS_DOCKER_COMPOSE_PROJECT is set
+#   compose_auto exactly ONE distinct com.docker.compose.project label visible
+#   prefix       OPS_DOCKER_CONTAINER_PREFIXES is set (names starting with any prefix)
+#   all_visible  fallback; multiple_projects populated when >1 compose labels found
+#   unavailable  docker unusable (no_cli / permission_denied / no_daemon)
+# ---------------------------------------------------------------------------
+ops_docker_discover() {
+    local avail perm state
+    read avail perm state <<<"$(docker_access)"
+
+    local explicit_str="${OPS_DOCKER_CONTAINERS:-}"
+    local compose_proj="${OPS_DOCKER_COMPOSE_PROJECT:-}"
+    local prefix_str="${OPS_DOCKER_CONTAINER_PREFIXES:-}"
+    local ps_raw=""
+
+    if [ "$state" = "ok" ]; then
+        ps_raw="$(docker ps -a --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Image}}' 2>/dev/null || true)"
+    fi
+
+    OPS_DOCKER_AVAIL="$avail" \
+    OPS_DOCKER_PERM="$perm" \
+    OPS_DOCKER_STATE="$state" \
+    OPS_DOCKER_EXPLICIT="$explicit_str" \
+    OPS_DOCKER_COMPOSE_PROJ="$compose_proj" \
+    OPS_DOCKER_PREFIX="$prefix_str" \
+    OPS_DOCKER_PS_RAW="$ps_raw" \
+    python3 - <<'PY'
+import json, os
+
+avail        = os.environ.get("OPS_DOCKER_AVAIL", "false") == "true"
+perm         = os.environ.get("OPS_DOCKER_PERM", "false") == "true"
+state        = os.environ.get("OPS_DOCKER_STATE", "no_cli")
+explicit_str = os.environ.get("OPS_DOCKER_EXPLICIT", "").strip()
+compose_proj = os.environ.get("OPS_DOCKER_COMPOSE_PROJ", "").strip()
+prefix_str   = os.environ.get("OPS_DOCKER_PREFIX", "").strip()
+ps_raw       = os.environ.get("OPS_DOCKER_PS_RAW", "").strip()
+
+explicit_list = explicit_str.split() if explicit_str else []
+prefix_list   = prefix_str.split() if prefix_str else []
+
+# Parse docker ps output: name, compose_label, image per tab-delimited line.
+all_names = []
+label_map = {}
+image_map = {}
+if ps_raw:
+    for line in ps_raw.splitlines():
+        parts = line.split("\t")
+        if parts and parts[0]:
+            name = parts[0]
+            all_names.append(name)
+            label_map[name] = parts[1] if len(parts) > 1 else ""
+            image_map[name] = parts[2] if len(parts) > 2 else ""
+
+# Docker unusable → unavailable.
+if state != "ok":
+    print(json.dumps({
+        "available": avail, "permission_ok": perm, "state": state,
+        "discovery_mode": "unavailable", "expected_configured": False,
+        "compose_project": "", "prefixes": [], "multiple_projects": [],
+        "expected": [], "all_visible": [],
+    }))
+    raise SystemExit(0)
+
+# Mode priority: explicit > compose > compose_auto > prefix > all_visible.
+discovery_mode    = "all_visible"
+expected          = []
+compose_out       = ""
+multiple_projects = []
+
+if explicit_list:
+    discovery_mode = "explicit"
+    expected       = explicit_list
+    compose_out    = compose_proj  # echo back if also set
+elif compose_proj:
+    discovery_mode = "compose"
+    compose_out    = compose_proj
+    expected       = [n for n in all_names if label_map.get(n, "") == compose_proj]
+else:
+    distinct = sorted({label_map[n] for n in all_names if label_map.get(n, "")})
+    if len(distinct) == 1:
+        discovery_mode = "compose_auto"
+        compose_out    = distinct[0]
+        expected       = [n for n in all_names if label_map.get(n, "") == compose_out]
+    elif prefix_list:
+        # prefix wins over all_visible (compose_auto inapplicable: 0 or >1 labels)
+        discovery_mode = "prefix"
+        expected       = [n for n in all_names if any(n.startswith(p) for p in prefix_list)]
+    else:
+        # all_visible: flag multiple_projects when >1 compose labels found
+        discovery_mode    = "all_visible"
+        multiple_projects = list(distinct)  # empty if no labels; >1 when ambiguous
+
+print(json.dumps({
+    "available": avail,
+    "permission_ok": perm,
+    "state": state,
+    "discovery_mode": discovery_mode,
+    "expected_configured": bool(explicit_list or compose_proj or prefix_list),
+    "compose_project": compose_out,
+    "prefixes": prefix_list,
+    "multiple_projects": multiple_projects,
+    "expected": expected,
+    "all_visible": all_names,
+}))
+PY
+}
+
+# ---------------------------------------------------------------------------
+# ops_redis_detect() — READ-ONLY Redis container finder.
+# Echoes the single container name whose NAME or IMAGE contains "redis" from
+# docker ps -a. Echoes empty string when zero or more than one match (ambiguous).
+# ---------------------------------------------------------------------------
+ops_redis_detect() {
+    local avail perm state
+    read avail perm state <<<"$(docker_access)"
+    [ "$state" = "ok" ] || { echo ""; return; }
+    local name image
+    local matches=()
+    while IFS=$'\t' read -r name image; do
+        case "${name}${image}" in
+            *redis*) matches+=("$name") ;;
+        esac
+    done < <(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null || true)
+    [ "${#matches[@]}" -eq 1 ] && echo "${matches[0]}" || echo ""
+}
 
 # ===========================================================================
 # Daemon reconciliation helpers
