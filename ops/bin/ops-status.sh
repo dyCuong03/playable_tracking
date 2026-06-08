@@ -58,8 +58,11 @@ if not d.get("available") or not d.get("permission_ok"):
         print("(%s)" % st)
     sys.exit()
 cs = d.get("containers", [])
+print("DOCKER HEALTH")
+if not d.get("expected_configured"):
+    print("expected containers not configured (set OPS_DOCKER_CONTAINERS to assert specific containers; showing all discovered)")
 if not cs:
-    print("docker ok — no containers found (set OPS_DOCKER_CONTAINERS to assert expected ones)")
+    print("docker ok — no containers found")
     sys.exit()
 fmt = "%-15s %-11s %-9s %-9s %-22s %s"
 print(fmt % ("CONTAINER", "STATE", "HEALTH", "RESTARTS", "PORTS", "REASON"))

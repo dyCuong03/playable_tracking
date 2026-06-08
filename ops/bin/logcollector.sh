@@ -4,7 +4,7 @@
 # Collects every backend log source into the daily archive ops/logs/<UTC-date>/:
 #   - app.log               : incremental tail of repo logs/pixel-tracking.txt
 #   - local-server.*.log    : incremental tail of repo logs/local-server.{out,err}.log
-#   - containers/<name>.log  : `docker logs --tail 500` per known container (if docker usable)
+#   - docker/<container>.log : `docker logs --tail 500` per known container (if docker usable)
 #   - pm2-status.json        : `pm2 jlist` snapshot (if pm2 present)
 # Then builds errors-rollup.txt (error/warn lines per source) and a summary JSON,
 # and raises an "error-spike" alert when this window's errors exceed ERROR_SPIKE.
@@ -19,8 +19,9 @@ ROLE="logcollector"
 heartbeat "$ROLE"
 
 DATE="$(date -u +%Y-%m-%d)"
+# Per-spec path: ops/logs/<date>/docker/<container>.log (was containers/ pre-audit).
 DAYDIR="$LOGS_DIR/$DATE"
-CONTDIR="$DAYDIR/containers"
+CONTDIR="$DAYDIR/docker"
 mkdir -p "$CONTDIR"
 
 OFFSETS_FILE="$STATUS_DIR/logcollector-offsets.json"
@@ -30,6 +31,9 @@ ALERTS_FILE="$STATUS_DIR/alerts.ndjson"
 ERROR_SPIKE="${ERROR_SPIKE:-20}"
 
 # Operator-declared containers win; otherwise fall back to the known names.
+# CONTAINERS_CONFIGURED records whether the operator explicitly declared them, so
+# the rollup/dashboard can say "expected-containers-not-configured" vs guessing.
+if [ -n "${OPS_DOCKER_CONTAINERS:-}" ]; then CONTAINERS_CONFIGURED=true; else CONTAINERS_CONFIGURED=false; fi
 CONTAINERS="${OPS_DOCKER_CONTAINERS:-pixel-server pixel-worker pixel-dispatcher redis nginx}"
 DOCKER_SINCE="${LOGCOLLECT_DOCKER_SINCE:-10m}"
 DOCKER_TAIL="${LOGCOLLECT_DOCKER_TAIL:-500}"
@@ -152,6 +156,10 @@ DOCKER_REASONS="$(mktemp)"
 read DOCKER_AVAIL DOCKER_PERM DOCKER_STATE <<<"$(docker_access)"
 DOCKER_STATUS="$DOCKER_STATE"
 DOCKER_WARNING=""
+# Stable machine token surfaced in rollup + status whenever docker logs could not
+# be collected (no CLI / no daemon / permission denied) — see spec task 4.
+DOCKER_WARN_CODE=""
+case "$DOCKER_STATE" in ok) ;; *) DOCKER_WARN_CODE="docker_unavailable_or_permission_denied";; esac
 
 if [ "$DOCKER_STATE" = "ok" ]; then
     present="$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)"
@@ -203,9 +211,10 @@ ROLLUP="$DAYDIR/errors-rollup.txt"
 {
     printf '# errors-rollup %s (generated %s)\n' "$DATE" "$(ts_now)"
     printf '# error/warn lines per collected source (last 200 each)\n'
-    printf '# docker_status=%s' "$DOCKER_STATUS"
-    [ -n "$DOCKER_WARNING" ] && printf '  WARNING: %s' "$DOCKER_WARNING"
-    printf '\n\n'
+    printf '# sources_collected=%s  docker_status=%s\n' "${#SRC_NAMES[@]}" "$DOCKER_STATUS"
+    [ -n "$DOCKER_WARN_CODE" ] && printf '# %s: %s\n' "$DOCKER_WARN_CODE" "$DOCKER_WARNING"
+    [ "$CONTAINERS_CONFIGURED" = false ] && printf '# expected-containers-not-configured: set OPS_DOCKER_CONTAINERS to collect container logs\n'
+    printf '\n'
     shopt -s nullglob
     for f in "$DAYDIR/app.log" "$DAYDIR/local-server.out.log" "$DAYDIR/local-server.err.log" "$CONTDIR"/*.log; do
         [ -f "$f" ] || continue
@@ -234,7 +243,8 @@ SOURCES_JSON+="]"
 
 DOCKER_JSON_SUMMARY="{\"status\":$(json_str "$DOCKER_STATUS"),\"available\":${DOCKER_AVAIL},\"permission_ok\":${DOCKER_PERM}"
 [ -n "$DOCKER_WARNING" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"warning\":$(json_str "$DOCKER_WARNING")"
-DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"containers_watched\":$(json_str "$CONTAINERS")}"
+[ -n "$DOCKER_WARN_CODE" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"warning_code\":$(json_str "$DOCKER_WARN_CODE")"
+DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"containers_configured\":${CONTAINERS_CONFIGURED},\"containers_watched\":$(json_str "$CONTAINERS")}"
 
 SUMMARY="{\"ts\":\"$(ts_now)\",\"role\":\"$ROLE\",\"date\":\"$DATE\",\"sources\":$SOURCES_JSON,\"source_count\":${#SRC_NAMES[@]},\"total_errors\":$TOTAL_ERR,\"total_warns\":$TOTAL_WARN,\"docker\":$DOCKER_JSON_SUMMARY}"
 printf '%s\n' "$SUMMARY" > "$SUMMARY_FILE"
