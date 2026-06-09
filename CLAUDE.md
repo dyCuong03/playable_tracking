@@ -69,7 +69,7 @@ Because Redis runs without persistence, the only durable buffer for in-flight ev
 
 ### Logging
 
-`services/log.service.js` writes JSON lines to `logs/pixel-tracking.txt` and stdout. All structured logs across the codebase use `console.log/error(JSON.stringify({...}))` — preserve that pattern instead of emitting plain strings.
+`services/log.service.js` writes JSON lines to `logs/pixel-tracking.txt` and daily NDJSON files such as `logs/server/<date>.ndjson`, `logs/dispatcher/<date>.ndjson`, `logs/worker/<date>.ndjson`, and `logs/redis-queue/<date>.ndjson`. All structured logs across the codebase use `console.log/error(JSON.stringify({...}))` with a `ts` field — preserve that pattern instead of emitting plain strings.
 
 ## Conventions
 

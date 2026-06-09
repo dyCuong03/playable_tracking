@@ -10,6 +10,7 @@ if (require.main === module) {
 
     startWorker().catch((error) => {
         console.error(JSON.stringify({
+            ts: new Date().toISOString(),
             level: "error",
             type: "bigquery-worker-startup",
             message: "Failed to start BigQuery worker",

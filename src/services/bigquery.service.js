@@ -473,6 +473,7 @@ const logInsertError = (error, row, logEntry, event, tableName) => {
 
     console.error(
         JSON.stringify({
+            ts: new Date().toISOString(),
             level: "error",
             type: "bigquery-insert",
             message: error.message,
@@ -492,6 +493,7 @@ const insertBatch = async (tableName, rows) => {
     assertValidFormattedRows(tableName, formattedRows, fieldTypes, { jsonMode: "string" });
 
     console.error(JSON.stringify({
+        ts: new Date().toISOString(),
         level: "info",
         type: "bigquery-debug",
         message: "Prepared BigQuery insert payload",

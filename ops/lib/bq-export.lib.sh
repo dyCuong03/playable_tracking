@@ -325,7 +325,7 @@ PY
 # Reads raw nginx log lines from stdin; writes valid parsed NDJSON rows to stdout.
 # Detects JSON lines (start with '{') → pixel_json format (ts,remote_addr,request_id,
 #   method,uri,args,status,body_bytes_sent,request_time,upstream_response_time,
-#   upstream_status,http_referer,http_user_agent,host).
+#   upstream_status,http_referer,http_user_agent,host,data).
 # Falls back to nginx combined format for non-JSON lines.
 # Unparseable lines are silently skipped (count logged to stderr).
 _bq_nginx_parse_lines() {
@@ -447,7 +447,8 @@ for raw_line in sys.stdin:
             request_id  = d.get("request_id") or None
             method      = d.get("method") or None
             uri         = d.get("uri") or ""
-            args_str    = d.get("args") or ""
+            data_obj    = d.get("data") if isinstance(d.get("data"), dict) else {}
+            args_str    = d.get("args") or data_obj.get("query") or ""
             status_raw  = d.get("status")
             body_bytes  = d.get("body_bytes_sent")
             req_time    = d.get("request_time")

@@ -56,6 +56,21 @@ const readAllQueuedRows = async () => {
     return rows;
 };
 
+const readAllQueuedItems = async () => {
+    const entries = await fs.promises.readdir(PENDING_DIR).catch(() => []);
+    const items = [];
+
+    for (const entry of entries) {
+        if (!entry.endsWith(".ndjson")) {
+            continue;
+        }
+
+        items.push(...await parseQueueFile(path.join(PENDING_DIR, entry)));
+    }
+
+    return items;
+};
+
 // ─── 1×1 GIF response for all four event types ───────────────────────────────
 
 test("GET /p.gif: start event returns 200 image/gif immediately", async () => {
@@ -172,6 +187,30 @@ test("GET /p.gif persists event to durable queue before responding", async () =>
     assert.ok(
         stats.pending.totalBytes + stats.ready.totalBytes + stats.processing.totalBytes > 0
     );
+});
+
+test("queued item preserves original client URL query data for Redis audit logs", async () => {
+    await request(app)
+        .get("/p.gif")
+        .query({
+            session_id: "sess-url-data-1",
+            event_name: "interaction",
+            event_time: "2026-06-04T10:01:00.000Z",
+            event_params: JSON.stringify({ name: "btn_buy" }),
+            pid: "com.archer.cat.kitchen",
+            playable_id: "PA0006",
+            custom_param: "client-value",
+        })
+        .expect(200);
+
+    await waitForQueueData();
+    const items = await readAllQueuedItems();
+    const item = items.find((entry) => entry.row && entry.row.session_id === "sess-url-data-1");
+
+    assert.ok(item, "Queue item for sess-url-data-1 not found");
+    assert.equal(item.urlData.query.session_id, "sess-url-data-1");
+    assert.equal(item.urlData.query.custom_param, "client-value");
+    assert.equal(item.urlData.event_params_parsed.name, "btn_buy");
 });
 
 // ─── Row content: event_time comes from client, received_at from server ───────

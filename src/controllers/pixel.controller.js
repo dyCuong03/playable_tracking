@@ -2,8 +2,43 @@ const { buildEvent } = require("../services/event.service");
 const { sendPixel } = require("../services/pixel.service");
 const { buildRow, resolveTableName } = require("../services/bigquery.service");
 const { persistRequest } = require("../services/request-dispatcher.service");
+const logService = require("../services/log.service");
 
 const EVENT_NAME_WHITELIST = new Set(["start", "interaction", "store_trigger", "end"]);
+
+const normalizeQueryValue = (value) => {
+    if (Array.isArray(value)) {
+        return value.map((entry) => String(entry));
+    }
+
+    if (value === undefined || value === null) {
+        return "";
+    }
+
+    return String(value);
+};
+
+const buildUrlData = (req, event) => {
+    const query = req.query || {};
+    const queryData = Object.fromEntries(
+        Object.entries(query).map(([key, value]) => [key, normalizeQueryValue(value)])
+    );
+
+    return {
+        request_uri: req.originalUrl || req.url || "",
+        path: req.path || "",
+        query: queryData,
+        event_params_parsed: event.params || {},
+    };
+};
+
+const logServerRequest = (entry) => {
+    logService.writeDaily("server", {
+        level: entry.statusCode >= 500 ? "error" : (entry.statusCode >= 400 ? "warn" : "info"),
+        type: "pixel-server-request",
+        ...entry,
+    }, false);
+};
 
 // Returns an array of error objects. Empty array means valid.
 // Validation failures skip BigQuery writes but the pixel is always served.
@@ -66,20 +101,34 @@ const validateEvent = (event) => {
 };
 
 exports.trackPixel = async (req, res) => {
+    const serverStartAt = Date.now();
     const event = buildEvent(req);
+    const urlData = buildUrlData(req, event);
     const errors = validateEvent(event);
 
     if (errors.length > 0) {
+        const durationMs = Date.now() - serverStartAt;
         console.error(JSON.stringify({
+            ts: new Date().toISOString(),
             level: "warn",
             type: "event-validation",
             message: "Invalid event payload — skipping BigQuery write",
             errors,
             sid: event.sid,
             eventName: event.event,
+            server_duration_ms: durationMs,
         }));
 
         sendPixel(res, 400);
+        logServerRequest({
+            message: "Invalid event payload",
+            statusCode: 400,
+            server_duration_ms: durationMs,
+            event_name: event.event || null,
+            session_id: event.sid || null,
+            data: urlData,
+            errors,
+        });
         return;
     }
 
@@ -90,16 +139,41 @@ exports.trackPixel = async (req, res) => {
         await persistRequest({
             tableName,
             row,
+            urlData,
         });
         sendPixel(res);
+        logServerRequest({
+            message: "Tracking request persisted to durable queue",
+            statusCode: 200,
+            server_duration_ms: Date.now() - serverStartAt,
+            tableName,
+            event_hash: row.event_hash || null,
+            event_name: row.event_name || null,
+            session_id: row.session_id || null,
+            data: urlData,
+        });
     } catch (error) {
+        const durationMs = Date.now() - serverStartAt;
         console.error(JSON.stringify({
+            ts: new Date().toISOString(),
             level: "error",
             type: "request-persist",
             message: "Failed to persist tracking request",
             reason: error.message,
+            server_duration_ms: durationMs,
         }));
 
         sendPixel(res, 503);
+        logServerRequest({
+            message: "Failed to persist tracking request",
+            statusCode: 503,
+            server_duration_ms: durationMs,
+            tableName,
+            event_hash: row.event_hash || null,
+            event_name: row.event_name || null,
+            session_id: row.session_id || null,
+            data: urlData,
+            reason: error.message,
+        });
     }
 };

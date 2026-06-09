@@ -695,6 +695,8 @@ rolling restart of app-only containers does **not** reload nginx's config.
 ```nginx
 log_format pixel_json escape=json
     '{"ts":"$time_iso8601",'
+     '"server_time":"$time_iso8601",'
+     '"server_epoch_time":"$msec",'
      '"remote_addr":"$remote_addr",'
      '"request_id":"$request_id",'
      '"method":"$request_method",'
@@ -703,11 +705,14 @@ log_format pixel_json escape=json
      '"status":$status,'
      '"body_bytes_sent":$body_bytes_sent,'
      '"request_time":$request_time,'
+     '"request_processing_time":$request_time,'
      '"upstream_response_time":"$upstream_response_time",'
+     '"upstream_processing_time":"$upstream_response_time",'
      '"upstream_status":"$upstream_status",'
      '"http_referer":"$http_referer",'
      '"http_user_agent":"$http_user_agent",'
-     '"host":"$host"}';
+     '"host":"$host",'
+     '"data":{"request_uri":"$request_uri","query":"$args", "...known pixel query args":"..."} }';
 
 access_log /var/log/nginx/access.log pixel_json;
 error_log  /var/log/nginx/error.log  warn;
@@ -736,6 +741,14 @@ exporter run:
 | `ops/logs/<date>/bq/redis_metrics.ndjson` | Parsed NDJSON — one Redis INFO row per poll interval | Staging file before BigQuery upload |
 | `ops/logs/<date>/bq/nginx_requests.status.json` | Status file (created when the nginx source is unavailable) | Explains why `nginx_requests.ndjson` is absent |
 | `ops/logs/<date>/bq/redis_metrics.status.json` | Status file (created when Redis is not configured) | Explains why `redis_metrics.ndjson` is absent |
+| `logs/server/<date>.ndjson` | Pixel-server runtime/startup and `/p.gif` request audit rows, including full client query data | Server-side request audit beyond nginx edge logs |
+| `logs/dispatcher/<date>.ndjson` | Dispatcher startup/error/batch rows when durable queue files are sent to Redis | Queue bridge audit |
+| `logs/worker/<date>.ndjson` | BigQuery worker startup/insert/retry/drop/error rows, including Redis item summaries and client URL data | Worker-side Redis→BigQuery audit |
+| `logs/redis-queue/<date>.ndjson` | One JSON line per successful Redis `XADD` / pipeline enqueue, including `data` and full `queue_item` | Durable daily audit of requests handed to Redis |
+
+For Redis enqueue audit rows, `data.query` contains the full original client URL
+query object, and `data.event_params_parsed` contains the parsed event payload
+used by validation / BigQuery row construction.
 
 The **docker/** files are raw text, useful for grep / incident investigation.
 The **bq/** NDJSON files are structured and ready for analytics — fields are

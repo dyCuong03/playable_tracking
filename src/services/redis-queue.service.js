@@ -10,6 +10,7 @@ const {
     redisUnavailableCooldownMs,
     redisErrorLogIntervalMs,
 } = require("../config");
+const logService = require("./log.service");
 
 let client;
 let clientPromise;
@@ -44,6 +45,7 @@ const logRedisError = (error) => {
 
     lastRedisErrorLogAt = now;
     console.error(JSON.stringify({
+        ts: new Date().toISOString(),
         level: "error",
         type: "redis-queue",
         message: error.message,
@@ -144,6 +146,41 @@ const encodeItem = (item) => JSON.stringify({
     enqueuedAt: item && item.enqueuedAt ? item.enqueuedAt : new Date().toISOString(),
 });
 
+const buildRedisQueueLogEntry = (streamName, item, messageId) => {
+    const row = item && item.row ? item.row : {};
+    const urlData = item && item.urlData ? item.urlData : null;
+
+    return {
+        level: "info",
+        type: "redis-enqueue",
+        stream: streamName,
+        message_id: messageId || null,
+        tableName: item && item.tableName ? item.tableName : null,
+        event_hash: row.event_hash || null,
+        session_id: row.session_id || null,
+        event_name: row.event_name || null,
+        event_time: row.event_time || null,
+        received_at: row.received_at || null,
+        data: urlData || {
+            event_params: row.event_params || {},
+        },
+        event_params: row.event_params || {},
+        queue_item: item || {},
+    };
+};
+
+const logRedisQueueItems = (streamName, items, messageIds = []) => {
+    if (!items.length) {
+        return;
+    }
+
+    logService.writeDailyBatch(
+        "redis-queue",
+        items.map((item, index) => buildRedisQueueLogEntry(streamName, item, messageIds[index])),
+        true
+    );
+};
+
 const decodeEntryFields = (fields) => {
     const data = {};
 
@@ -216,19 +253,25 @@ const appendToStream = async (streamName, item) => sendRedisCommand([
     encodeItem(item),
 ]);
 
-const produceToStream = async (streamName, item, options = {}) => executeRedisCommand(
-    [
-        "XADD",
-        streamName,
-        "MAXLEN",
-        "~",
-        Math.max(1000, redisQueueMaxLen),
-        "*",
-        "payload",
-        encodeItem(item),
-    ],
-    options
-);
+const produceToStream = async (streamName, item, options = {}) => {
+    const messageId = await executeRedisCommand(
+        [
+            "XADD",
+            streamName,
+            "MAXLEN",
+            "~",
+            Math.max(1000, redisQueueMaxLen),
+            "*",
+            "payload",
+            encodeItem(item),
+        ],
+        options
+    );
+
+    logRedisQueueItems(streamName, [item], [messageId]);
+
+    return messageId;
+};
 
 const appendToStreamBatch = async (streamName, items, options = {}) => {
     if (!items.length) {
@@ -260,7 +303,7 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
         ].map((value) => String(value)));
     }
 
-    return withTimeout(
+    const response = await withTimeout(
         pipeline.execAsPipeline(),
         timeoutMs,
         timeoutMessage
@@ -271,6 +314,10 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
 
         throw error;
     });
+
+    logRedisQueueItems(streamName, items, response);
+
+    return response;
 };
 
 const enqueueEvent = async (queueItem, options = {}) => {

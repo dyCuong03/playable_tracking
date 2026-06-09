@@ -17,6 +17,7 @@ const {
     getQueueStats,
 } = require("./bigquery-queue.service");
 const { enqueueEventBatch } = require("./redis-queue.service");
+const logService = require("./log.service");
 
 const workerName = `${os.hostname()}-${process.pid}`.replace(/[^a-zA-Z0-9_-]/g, "-");
 
@@ -34,20 +35,39 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const shouldLogNow = () => (Date.now() - lastErrorLogAt) >= bigQueryErrorLogIntervalMs;
 
+const logDispatcher = (level, type, message, details = {}, silent = false) => {
+    const entry = {
+        ts: new Date().toISOString(),
+        level,
+        type,
+        message,
+        worker: workerName,
+        ...details,
+    };
+
+    if (!silent) {
+        if (level === "error") {
+            console.error(JSON.stringify(entry));
+        } else if (level === "warn") {
+            console.warn(JSON.stringify(entry));
+        } else {
+            console.log(JSON.stringify(entry));
+        }
+    }
+
+    logService.writeDaily("dispatcher", entry, true);
+};
+
 const logBridgeError = (message, error, details = {}) => {
     if (!shouldLogNow()) {
         return;
     }
 
     lastErrorLogAt = Date.now();
-    console.error(JSON.stringify({
-        level: "error",
-        type: "request-dispatcher",
-        message,
+    logDispatcher("error", "request-dispatcher", message, {
         reason: error.message,
-        worker: workerName,
         ...details,
-    }));
+    });
 };
 
 const persistRequest = async (item) => enqueueDiskEvent(item);
@@ -109,6 +129,11 @@ const runBridgeLoop = async () => {
                 fileBatches.map((entry) => completeProcessingFile(entry.claimedFile.processingFile))
             );
             bridgeState.lastSuccessAt = new Date().toISOString();
+            logDispatcher("info", "request-dispatcher-batch", "Dispatched durable queue files to Redis", {
+                processingFile,
+                fileCount: claimedFiles.length,
+                itemCount: items.length,
+            });
         } catch (error) {
             if (claimedFiles.length > 0) {
                 await Promise.all(
@@ -137,6 +162,7 @@ const startDispatcher = () => {
     started = true;
     stopping = false;
     bridgeState.running = true;
+    logDispatcher("info", "request-dispatcher-start", "Request dispatcher started");
 
     bridgePromise = runBridgeLoop().finally(() => {
         bridgeState.running = false;

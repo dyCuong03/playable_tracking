@@ -23,6 +23,7 @@ const {
     requeueItems,
     rejectItems,
 } = require("./redis-queue.service");
+const logService = require("./log.service");
 
 const workerName = (bigQueryWorkerName || `${os.hostname()}-${process.pid}`)
     .replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -36,13 +37,23 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const shouldLogNow = (lastLogAt) => (Date.now() - lastLogAt) >= bigQueryErrorLogIntervalMs;
 
 const logWorker = (level, type, message, details = {}) => {
+    const entry = {
+        ts: new Date().toISOString(),
+        level,
+        type,
+        message,
+        worker: workerName,
+        ...details,
+    };
+
     if (level === "error") {
         if (!shouldLogNow(lastErrorLogAt)) {
             return;
         }
 
         lastErrorLogAt = Date.now();
-        console.error(JSON.stringify({ level, type, message, worker: workerName, ...details }));
+        console.error(JSON.stringify(entry));
+        logService.writeDaily("worker", entry, true);
         return;
     }
 
@@ -52,12 +63,33 @@ const logWorker = (level, type, message, details = {}) => {
         }
 
         lastWarnLogAt = Date.now();
-        console.warn(JSON.stringify({ level, type, message, worker: workerName, ...details }));
+        console.warn(JSON.stringify(entry));
+        logService.writeDaily("worker", entry, true);
         return;
     }
 
-    console.log(JSON.stringify({ level, type, message, worker: workerName, ...details }));
+    console.log(JSON.stringify(entry));
+    logService.writeDaily("worker", entry, true);
 };
+
+const summarizeItems = (items) => items.map((item) => {
+    const row = item && item.row ? item.row : {};
+    const data = item && item.urlData
+        ? item.urlData
+        : { event_params: row.event_params || {} };
+
+    return {
+        message_id: item && item.messageId ? item.messageId : null,
+        attempts: Number(item && item.attempts ? item.attempts : 0),
+        tableName: item && item.tableName ? item.tableName : null,
+        event_hash: row.event_hash || null,
+        session_id: row.session_id || null,
+        event_name: row.event_name || null,
+        event_time: row.event_time || null,
+        received_at: row.received_at || null,
+        data,
+    };
+});
 
 const getFailedInsertIds = (error) => {
     if (!Array.isArray(error && error.errors)) {
@@ -176,6 +208,7 @@ const buildChunks = (items) => {
 const buildRetriedItem = (item, errorMessage) => ({
     tableName: item.tableName,
     row: item.row,
+    urlData: item.urlData || null,
     attempts: Number(item.attempts || 0) + 1,
     lastError: errorMessage,
     lastAttemptAt: new Date().toISOString(),
@@ -205,6 +238,7 @@ const logRejectedItems = async (rejectedItems, tableName) => {
         rejectedItems.map((rejected) => ({
             tableName,
             row: rejected.item.row,
+            urlData: rejected.item.urlData || null,
             rejectedAt: new Date().toISOString(),
             attempts: Number(rejected.item.attempts || 0),
             error: rejected.message,
@@ -239,6 +273,12 @@ const processMessages = async (items) => {
                 chunk.items.map((item) => item.row)
             );
             await acknowledgeMessages(chunkMessageIds);
+            logWorker("info", "bigquery-worker-insert", "Inserted Redis chunk to BigQuery", {
+                tableName: chunk.tableName,
+                count: chunk.items.length,
+                messageIds: chunkMessageIds,
+                data: summarizeItems(chunk.items),
+            });
         } catch (error) {
             const failedInsertIds = new Set(getFailedInsertIds(error));
 
@@ -289,6 +329,7 @@ const processMessages = async (items) => {
                         reason: error.message,
                         details: getErrorDetails(error),
                         rowErrors: getErrorRowDiagnostics(error),
+                        data: summarizeItems(retryItems),
                     });
                     await sleep(Math.max(1000, bigQueryRetryDelayMs));
                 }
@@ -300,6 +341,7 @@ const processMessages = async (items) => {
                         reason: error.message,
                         details: getErrorDetails(error),
                         rowErrors: getErrorRowDiagnostics(error),
+                        data: summarizeItems(rejectedItems.map((rejected) => rejected.item)),
                     });
                 }
 
@@ -328,6 +370,7 @@ const processMessages = async (items) => {
                 details: getErrorDetails(error),
                 rowErrors: getErrorRowDiagnostics(error),
                 sampleRow: chunk.items[0] && chunk.items[0].row ? chunk.items[0].row : null,
+                data: summarizeItems(chunk.items),
             });
 
             await sleep(Math.max(1000, bigQueryRetryDelayMs));

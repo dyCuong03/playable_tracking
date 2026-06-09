@@ -40,6 +40,8 @@ http {
     # ---------------------------------------------------------------------------
     log_format pixel_json escape=json
         '{"ts":"$time_iso8601",'
+         '"server_time":"$time_iso8601",'
+         '"server_epoch_time":"$msec",'
          '"remote_addr":"$remote_addr",'
          '"request_id":"$request_id",'
          '"method":"$request_method",'
@@ -48,11 +50,36 @@ http {
          '"status":$status,'
          '"body_bytes_sent":$body_bytes_sent,'
          '"request_time":$request_time,'
+         '"request_processing_time":$request_time,'
          '"upstream_response_time":"$upstream_response_time",'
+         '"upstream_processing_time":"$upstream_response_time",'
          '"upstream_status":"$upstream_status",'
          '"http_referer":"$http_referer",'
          '"http_user_agent":"$http_user_agent",'
-         '"host":"$host"}';
+         '"host":"$host",'
+         '"data":{'
+            '"request_uri":"$request_uri",'
+            '"query":"$args",'
+            '"e":"$arg_e",'
+            '"event":"$arg_event",'
+            '"event_name":"$arg_event_name",'
+            '"sid":"$arg_sid",'
+            '"session_id":"$arg_session_id",'
+            '"ts":"$arg_ts",'
+            '"event_time":"$arg_event_time",'
+            '"event_params":"$arg_event_params",'
+            '"env":"$arg_env",'
+            '"environment":"$arg_environment",'
+            '"pid":"$arg_pid",'
+            '"package_name":"$arg_package_name",'
+            '"project_id":"$arg_project_id",'
+            '"playableId":"$arg_playableId",'
+            '"playable_id":"$arg_playable_id",'
+            '"platform":"$arg_platform",'
+            '"plf":"$arg_plf",'
+            '"camp":"$arg_camp",'
+            '"campaign_raw":"$arg_campaign_raw"'
+         '}}';
 
     access_log /var/log/nginx/access.log pixel_json;
     error_log  /var/log/nginx/error.log  warn;

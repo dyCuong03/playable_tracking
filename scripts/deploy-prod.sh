@@ -21,6 +21,7 @@ DISPATCHER_COUNT="${DISPATCHER_COUNT:-1}"
 APP_REPLICAS="${APP_REPLICAS:-8}"
 WEB_CONCURRENCY="${WEB_CONCURRENCY:-1}"
 QUEUE_ROOT_DIR="$(pwd)/data"
+LOG_ROOT_DIR="$(pwd)/logs"
 QUEUE_DIR_IN_CONTAINER="${BIGQUERY_QUEUE_DIR:-data/bigquery-queue}"
 BIGQUERY_ENABLED="${BIGQUERY_ENABLED:-true}"
 BIGQUERY_DATASET="${BIGQUERY_DATASET:-playable_tracking}"
@@ -58,7 +59,7 @@ if [[ ! -f "$KEY_FILE" ]]; then
   exit 1
 fi
 
-mkdir -p "$QUEUE_ROOT_DIR"
+mkdir -p "$QUEUE_ROOT_DIR" "$LOG_ROOT_DIR"
 
 # =========================
 # CHECK DOCKER
@@ -177,6 +178,7 @@ for i in $(seq 1 "$APP_REPLICAS"); do
     -e REDIS_ERROR_LOG_INTERVAL_MS=${REDIS_ERROR_LOG_INTERVAL_MS} \
     -e GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/pixel-writer-key.json \
     -v "${QUEUE_ROOT_DIR}":/app/data \
+    -v "${LOG_ROOT_DIR}":/app/logs \
     -v "$KEY_FILE":/app/credentials/pixel-writer-key.json:ro \
     "$IMAGE_NAME"
 done
@@ -239,6 +241,7 @@ for i in $(seq 1 "$WORKER_COUNT"); do
     -e REDIS_ERROR_LOG_INTERVAL_MS=${REDIS_ERROR_LOG_INTERVAL_MS} \
     -e GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/pixel-writer-key.json \
     -v "${QUEUE_ROOT_DIR}":/app/data \
+    -v "${LOG_ROOT_DIR}":/app/logs \
     -v "$KEY_FILE":/app/credentials/pixel-writer-key.json:ro \
     "$IMAGE_NAME" \
     node src/worker.js
@@ -271,6 +274,7 @@ for i in $(seq 1 "$DISPATCHER_COUNT"); do
     -e REQUEST_QUEUE_ROTATE_MIN_BYTES=${REQUEST_QUEUE_ROTATE_MIN_BYTES} \
     -e REQUEST_QUEUE_ROTATE_MAX_AGE_MS=${REQUEST_QUEUE_ROTATE_MAX_AGE_MS} \
     -v "${QUEUE_ROOT_DIR}":/app/data \
+    -v "${LOG_ROOT_DIR}":/app/logs \
     "$IMAGE_NAME" \
     node src/dispatcher.js
 done
