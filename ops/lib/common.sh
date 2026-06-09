@@ -39,6 +39,27 @@ ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # Filename-safe UTC stamp.
 ts_file() { date -u +%Y%m%dT%H%M%SZ; }
 
+# Local ops day used for daily archive directories. Operators read these folders
+# by server-local calendar day: 00:00 inclusive to next-day 00:00 exclusive.
+ops_log_date() {
+    if [ -n "${OPS_LOG_DATE:-}" ]; then
+        printf '%s\n' "$OPS_LOG_DATE"
+    else
+        date +%Y-%m-%d
+    fi
+}
+
+ops_day_start() {
+    local day="${1:-$(ops_log_date)}"
+    date -d "$day 00:00:00" +%Y-%m-%dT%H:%M:%S%:z
+}
+
+ops_day_end() {
+    local day="${1:-$(ops_log_date)}" start_epoch
+    start_epoch="$(date -d "$day 00:00:00" +%s)"
+    date -d "@$((start_epoch + 86400))" +%Y-%m-%dT%H:%M:%S%:z
+}
+
 # JSON-escape a string and wrap in quotes.
 json_str() {
     printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'

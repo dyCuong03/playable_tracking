@@ -2,7 +2,7 @@
 # ops/bin/bq-log-exporter.sh — one-shot BigQuery log export for the pixel-tracking stack.
 #
 # Collects nginx access log rows and Redis metrics, stages them to daily NDJSON
-# files under ops/logs/<UTC-date>/bq/, invokes the BigQuery uploader, maintains
+# files under ops/logs/<local-date>/bq/, invokes the BigQuery uploader, maintains
 # a byte-offset / docker-since cursor, and writes ops/status/bq-export-latest.json.
 #
 # Usage:
@@ -51,7 +51,7 @@ DRY_FLAG=""
 # Master switch — write disabled status and exit 0 when not enabled.
 # ---------------------------------------------------------------------------
 EXPORT_ENABLED="${OPS_BQ_EXPORT_ENABLED:-0}"
-DATE="$(date -u +%Y-%m-%d)"
+DATE="$(ops_log_date)"
 
 if [ "$EXPORT_ENABLED" != "1" ]; then
     bq_write_latest \

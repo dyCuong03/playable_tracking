@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # logcollector.sh — one-shot backend log collector for the pixel-tracking server.
 #
-# Collects every backend log source into the daily archive ops/logs/<UTC-date>/:
+# Collects every backend log source into the daily archive ops/logs/<local-date>/:
 #   - app.log               : incremental tail of repo logs/pixel-tracking.txt
 #   - local-server.*.log    : incremental tail of repo logs/local-server.{out,err}.log
-#   - docker/<container>.log : `docker logs --tail 500` per known container (if docker usable)
+#   - docker/<container>.log : `docker logs` for the local 00:00..next 00:00 day window
 #   - pm2-status.json        : `pm2 jlist` snapshot (if pm2 present)
 # Then builds errors-rollup.txt (error/warn lines per source) and a summary JSON,
 # and raises an "error-spike" alert when this window's errors exceed ERROR_SPIKE.
@@ -21,7 +21,7 @@ set -u
 ROLE="logcollector"
 heartbeat "$ROLE"
 
-DATE="$(date -u +%Y-%m-%d)"
+DATE="$(ops_log_date)"
 # Per-spec path: ops/logs/<date>/docker/<container>.log (was containers/ pre-audit).
 DAYDIR="$LOGS_DIR/$DATE"
 CONTDIR="$DAYDIR/docker"
@@ -34,8 +34,11 @@ ALERTS_FILE="$STATUS_DIR/alerts.ndjson"
 ERROR_SPIKE="${ERROR_SPIKE:-20}"
 
 # Docker log collection tuning — containers determined at runtime via ops_docker_discover.
-DOCKER_SINCE="${LOGCOLLECT_DOCKER_SINCE:-10m}"
-DOCKER_TAIL="${LOGCOLLECT_DOCKER_TAIL:-500}"
+# Defaults cover the whole local ops day, so ops/logs/YYYY-MM-DD/docker/*.log
+# represents 00:00 inclusive through next-day 00:00 exclusive.
+DOCKER_SINCE="${LOGCOLLECT_DOCKER_SINCE:-$(ops_day_start "$DATE")}"
+DOCKER_UNTIL="${LOGCOLLECT_DOCKER_UNTIL:-$(ops_day_end "$DATE")}"
+DOCKER_TAIL="${LOGCOLLECT_DOCKER_TAIL:-all}"
 
 # error/warn matchers for JSON-line app logs (tolerate a space after the colon).
 ERR_RE='"level":[[:space:]]*"error"'
@@ -231,7 +234,10 @@ if [ "$DOCKER_STATE" = "ok" ]; then
                 _docker_attempted=$((_docker_attempted+1))
                 if printf '%s\n' "$present" | grep -qx "$c"; then
                     tmp="$(mktemp)"
-                    if docker logs --since "$DOCKER_SINCE" --tail "$DOCKER_TAIL" "$c" > "$tmp" 2>&1; then
+                    docker_log_args=(logs --since "$DOCKER_SINCE" --until "$DOCKER_UNTIL")
+                    [ "$DOCKER_TAIL" != "all" ] && docker_log_args+=(--tail "$DOCKER_TAIL")
+                    docker_log_args+=("$c")
+                    if docker "${docker_log_args[@]}" > "$tmp" 2>&1; then
                         cat "$tmp" > "$CONTDIR/$c.log"
                         record_source "container:$c" "$tmp" "$GENERIC_ERR_RE" "$GENERIC_WARN_RE"
                         _docker_collected=$((_docker_collected+1))
@@ -334,7 +340,7 @@ for i in "${!SRC_NAMES[@]}"; do
 done
 SOURCES_JSON+="]"
 
-DOCKER_JSON_SUMMARY="{\"status\":$(json_str "$DOCKER_STATUS"),\"available\":${DOCKER_AVAIL},\"permission_ok\":${DOCKER_PERM},\"discovery_mode\":$(json_str "$DISCOVERY_MODE"),\"expected_configured\":${EXPECTED_CONFIGURED},\"compose_project\":$(json_str "$COMPOSE_PROJECT")"
+DOCKER_JSON_SUMMARY="{\"status\":$(json_str "$DOCKER_STATUS"),\"available\":${DOCKER_AVAIL},\"permission_ok\":${DOCKER_PERM},\"discovery_mode\":$(json_str "$DISCOVERY_MODE"),\"expected_configured\":${EXPECTED_CONFIGURED},\"compose_project\":$(json_str "$COMPOSE_PROJECT"),\"since\":$(json_str "$DOCKER_SINCE"),\"until\":$(json_str "$DOCKER_UNTIL"),\"tail\":$(json_str "$DOCKER_TAIL")"
 [ -n "$DOCKER_WARNING" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"warning\":$(json_str "$DOCKER_WARNING")"
 [ -n "$DOCKER_WARN_CODE" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"warning_code\":$(json_str "$DOCKER_WARN_CODE")"
 [ -n "$DOCKER_ZERO_REASON" ] && DOCKER_JSON_SUMMARY="${DOCKER_JSON_SUMMARY},\"zero_reason\":$(json_str "$DOCKER_ZERO_REASON")"

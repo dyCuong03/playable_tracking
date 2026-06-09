@@ -28,7 +28,7 @@ QUEUE_DIR="${BIGQUERY_QUEUE_DIR:-$REPO_DIR/data/bigquery-queue}"
 STATE_FILE="$STATUS_DIR/monitor-alert-state.json"
 ALERTS_FILE="$STATUS_DIR/alerts.ndjson"
 LATEST_FILE="$STATUS_DIR/monitor-latest.json"
-DATE_DIR="$LOGS_DIR/$(date -u +%Y-%m-%d)"
+DATE_DIR="$LOGS_DIR/$(ops_log_date)"
 mkdir -p "$DATE_DIR"
 STATUS_NDJSON="$DATE_DIR/status.ndjson"
 

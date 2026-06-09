@@ -62,6 +62,7 @@ on:
       - main
     paths:
       - 'src/**'
+      - 'ops/**'
       - 'scripts/**'
       - 'Dockerfile'
       - 'package.json'
@@ -132,11 +133,9 @@ jobs:
           ssh -p "$PORT" ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
             'curl -fsS http://127.0.0.1:9000/health'
 
-      # Post-deploy: bring the ops monitoring daemons to a healthy state.
-      # ops-start.sh is idempotent (reconciles pidfile + /proc cmdline + heartbeat),
-      # so re-running it never spawns duplicate daemons — it only restarts dead or
-      # ghost ones. `ops-status.sh gate` exits non-zero if monitor / logcollector /
-      # capacity are not healthy, failing the deploy.
+      # Post-deploy: restart the ops monitoring daemons from the deployed scripts,
+      # then gate their health. `ops-status.sh gate` exits non-zero if monitor /
+      # logcollector / capacity are not healthy, failing the deploy.
       #
       # Config strategy: ops/.env on the VPS is the operator's persistent config and
       # is NEVER overwritten by CI.  If it does not exist yet, CI bootstraps a minimal
@@ -202,6 +201,7 @@ jobs:
              [ -n "$_qa" ] && export OPS_LOG_QUERY_ALLOWLIST="$_qa"
              _dh="${{ vars.OPS_LOG_DROP_HEADERS }}"
              [ -n "$_dh" ] && export OPS_LOG_DROP_HEADERS="$_dh"
+             bash ops/bin/ops-stop.sh
              bash ops/bin/ops-start.sh
              sleep 8
              # Gate: core 3 daemons always checked; exporter health only when enabled.

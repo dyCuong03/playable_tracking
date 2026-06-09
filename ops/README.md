@@ -186,8 +186,8 @@ renders a `== DOCKER HEALTH ==` table. With `OPS_DOCKER_CONTAINERS` set, a
 **missing / exited / restarting / healthcheck-unhealthy** container raises a
 deduped alert in `ops/status/alerts.ndjson` (one key per container, with
 recovery). Unset → the monitor only lists discovered containers and never fails
-health on a missing name. logcollector also collects
-`docker logs --since <window> --tail <N>` per declared container into
+health on a missing name. logcollector also collects the local-day window
+(`00:00:00` through next-day `00:00:00`) per declared container into
 `ops/logs/<date>/docker/<container>.log` and folds error/warn/fatal/exception
 lines into `errors-rollup.txt`.
 
@@ -300,10 +300,10 @@ Any syntax error or test failure fails the workflow. It never runs the loadteste
 
 **post-deploy reconcile** — `.github/workflows/deploy.yml` has a final step that
 SSHes to the VPS, `cd`s into the repo, exports `PIXEL_BASE`, `chmod +x`es the ops
-scripts, runs `ops-start.sh`, then `ops-status.sh gate`. The gate exits non-zero
-if `monitor` / `logcollector` / `capacity` are not healthy, **failing the deploy**.
-`ops-start.sh` is idempotent (reconciles pidfile + `/proc` cmdline + heartbeat),
-so this step never spawns duplicate daemons. All VPS connection details come from
+scripts, runs `ops-stop.sh`, then `ops-start.sh`, then `ops-status.sh gate`. The
+gate exits non-zero if `monitor` / `logcollector` / `capacity` are not healthy,
+**failing the deploy**. Restarting first ensures the running daemons use the just
+deployed ops scripts. All VPS connection details come from
 GitHub Secrets (`VPS_HOST`/`VPS_USER`/`VPS_SSH_KEY`/`VPS_PORT`/`VPS_REPO_PATH`) —
 nothing is hardcoded.
 
@@ -344,7 +344,7 @@ CAPACITY_ENABLED=1 LOADTEST_ENV=production ALLOW_PROD_LOADTEST=1 bash ops/bin/op
 ops/
   bin/        role scripts + loop wrappers + dashboard/start/stop
   lib/        common.sh (shared shell helpers)
-  logs/       <UTC-date>/ daily archives + *-loop.out streams
+  logs/       <local-date>/ daily archives + *-loop.out streams
   reports/    stress-*.ndjson, capacity-history.ndjson, capacity-plan.md
   status/     *.pid, *.heartbeat, *-latest.json, alerts.ndjson, verdicts
 ```
@@ -360,7 +360,8 @@ ops/
 | `OPS_REDIS_CONTAINER` / `OPS_REDIS_QUEUE_KEY` | _(unset)_ / `pixel:events` | redis depth via `docker exec` fallback (monitor) |
 | `OPS_PIXEL_PROBE_PATH` / `OPS_PIXEL_PROBE_URL` / `OPS_PIXEL_EXPECT_CODE` | bare `/p.gif` / _(unset)_ / `200` | configurable pixel probe (monitor) |
 | `LOGCOLLECT_INTERVAL` | `60` | logcollector loop period (s) |
-| `LOGCOLLECT_DOCKER_SINCE` / `LOGCOLLECT_DOCKER_TAIL` | `10m` / `500` | docker-log window per container (logcollector) |
+| `OPS_LOG_DATE` | today's local date | override daily archive date for manual backfill (`YYYY-MM-DD`) |
+| `LOGCOLLECT_DOCKER_SINCE` / `LOGCOLLECT_DOCKER_UNTIL` / `LOGCOLLECT_DOCKER_TAIL` | local `00:00` / next-day `00:00` / `all` | docker-log window per container (logcollector) |
 | `ERROR_SPIKE` | `20` | error-spike alert threshold |
 | `CAPACITY_INTERVAL` / `CAPACITY_POLL` | `86400` / `300` | capacity re-test cadence / health poll (s) |
 | `STAGES` / `STAGE_SECONDS` / `FAIL_RATE` / `FAIL_P95_MS` | `10..1600` / `15` / `0.01` / `500` | stress ramp + degrade thresholds |
@@ -725,7 +726,7 @@ The exporter auto-detects JSON lines (first character `{`) and maps:
 
 ## Daily nginx/Redis logs and BigQuery export
 
-The ops stack writes two types of files under `ops/logs/<UTC-date>/` on every
+The ops stack writes two types of files under `ops/logs/<local-date>/` on every
 exporter run:
 
 | Path | Contents | Purpose |
@@ -767,15 +768,15 @@ run normally; only the BQ exporter reports incomplete data.
 
 ```bash
 # Verify today's dated directories exist
-ls -la ops/logs/$(date -u +%F)/
+ls -la ops/logs/$(date +%F)/
 
 # Check for real docker logs (not just a _docker-*.log status file).
 # _docker-skipped.log => Docker is fine but no expected containers configured
 # (set OPS_DOCKER_COMPOSE_PROJECT / OPS_DOCKER_CONTAINERS / OPS_DOCKER_LOG_ALL_VISIBLE=1).
-ls -la ops/logs/$(date -u +%F)/docker/
+ls -la ops/logs/$(date +%F)/docker/
 
 # Check BQ staging files — expect *.ndjson, not just *.status.json
-ls -la ops/logs/$(date -u +%F)/bq/
+ls -la ops/logs/$(date +%F)/bq/
 
 # Inspect the latest exporter run summary
 cat ops/status/bq-export-latest.json
