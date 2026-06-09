@@ -12,9 +12,13 @@ OUT="$LOGS_DIR/logcollector-loop.out"
 SELF_DIR="$(dirname "$0")"
 
 echo $$ > "$PIDFILE"
-cleanup() { cleanup_pidfile_if_owner "$PIDFILE" "$$"; }
-trap cleanup EXIT
-trap 'cleanup; exit 143' INT TERM
+cleanup() {
+    local rc="${1:-$?}"
+    jlog "info" "$ROLE" "logcollector loop exiting" "{\"exit\":$rc,\"pid\":$$}" >> "$OUT" 2>/dev/null || true
+    cleanup_pidfile_if_owner "$PIDFILE" "$$"
+}
+trap 'cleanup "$?"' EXIT
+trap 'cleanup 143; exit 143' INT TERM
 
 jlog "info" "$ROLE" "logcollector loop started" "{\"interval_s\":$INTERVAL,\"pid\":$$}" | tee -a "$OUT"
 

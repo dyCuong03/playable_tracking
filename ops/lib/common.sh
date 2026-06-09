@@ -308,6 +308,28 @@ is_heartbeat_fresh() {
     [ "$age" -ge 0 ] 2>/dev/null && [ "$age" -le "$max_age" ]
 }
 
+is_daemon_healthy() {
+    local pidfile="$1" expected="$2" hbfile="$3" max_age="$4" pid=""
+    [ -f "$pidfile" ] || return 1
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [ -n "$pid" ] || return 1
+    is_pid_alive "$pid" || return 1
+    is_expected_daemon "$pid" "$expected" || return 1
+    is_heartbeat_fresh "$hbfile" "$max_age" || return 1
+}
+
+wait_daemon_healthy() {
+    local pidfile="$1" expected="$2" hbfile="$3" max_age="$4" wait_s="$5"
+    local waited=0
+    case "$wait_s" in (*[!0-9]*|"") wait_s=20;; esac
+    while [ "$waited" -le "$wait_s" ]; do
+        is_daemon_healthy "$pidfile" "$expected" "$hbfile" "$max_age" && return 0
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
 # Emit one daemon's health as a JSON object with the fields separated out:
 #   name pid alive cmd_ok heartbeat_fresh healthy heartbeat_age_s cmd reason
 # Usage: daemon_status_json NAME PIDFILE EXPECTED_SCRIPT HEARTBEAT_FILE MAX_AGE_S
