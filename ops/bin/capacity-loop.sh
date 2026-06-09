@@ -31,8 +31,8 @@ VERDICT_FILE="$STATUS_DIR/last-stress-verdict.json"
 echo $$ > "$PID_FILE"
 # Clean the pid file on normal exit AND on signals (e.g. operator `kill`, timeout
 # SIGTERM, Ctrl-C). bash does NOT run the EXIT trap for untrapped signals, so the
-# signal traps call cleanup then exit (which also fires EXIT - harmless, rm -f).
-cleanup() { rm -f "$PID_FILE"; }
+# signal traps call cleanup then exit (which also fires EXIT harmlessly).
+cleanup() { cleanup_pidfile_if_owner "$PID_FILE" "$$"; }
 trap cleanup EXIT
 trap 'cleanup; exit 143' TERM INT
 

@@ -205,4 +205,11 @@ jobs:
              bash ops/bin/ops-start.sh
              sleep 8
              # Gate: core 3 daemons always checked; exporter health only when enabled.
-             bash ops/bin/ops-status.sh gate'
+             bash ops/bin/ops-status.sh gate || {
+               echo "== ops gate failed: recent loop logs =="
+               tail -n 120 ops/logs/logcollector-loop.out 2>/dev/null || true
+               tail -n 120 ops/logs/logcollector-loop.nohup.out 2>/dev/null || true
+               tail -n 120 ops/logs/monitor-loop.out 2>/dev/null || true
+               tail -n 120 ops/logs/capacity-loop.nohup.out 2>/dev/null || true
+               exit 1
+             }'

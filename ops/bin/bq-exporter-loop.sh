@@ -15,7 +15,9 @@ OUT="$LOGS_DIR/bq-exporter-loop.out"
 EXPORTER="$(dirname "$0")/bq-log-exporter.sh"
 
 echo $$ > "$PIDFILE"
-trap 'rm -f "$PIDFILE"' EXIT INT TERM
+cleanup() { cleanup_pidfile_if_owner "$PIDFILE" "$$"; }
+trap cleanup EXIT
+trap 'cleanup; exit 143' INT TERM
 
 jlog "info" "$ROLE" "bq-exporter loop started" "{\"interval_s\":$INTERVAL,\"pid\":$$}" | tee -a "$OUT"
 

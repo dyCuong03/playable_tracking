@@ -14,7 +14,9 @@ OUT_FILE="$LOGS_DIR/monitor-loop.out"
 MONITOR="$(dirname "$0")/monitor.sh"
 
 echo "$$" > "$PID_FILE"
-trap 'rm -f "$PID_FILE"' EXIT
+cleanup() { cleanup_pidfile_if_owner "$PID_FILE" "$$"; }
+trap cleanup EXIT
+trap 'cleanup; exit 143' TERM INT
 
 jlog "info" "$ROLE" "monitor loop started" "{\"pid\":$$,\"interval_s\":${INTERVAL}}" >> "$OUT_FILE"
 

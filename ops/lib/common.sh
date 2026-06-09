@@ -84,6 +84,15 @@ heartbeat() {
     ts_now > "$STATUS_DIR/${role}.heartbeat" 2>/dev/null || true
 }
 
+# Remove a pidfile only when it still belongs to the current process. This avoids
+# stop/start races where an old daemon's EXIT trap deletes a new daemon's pidfile.
+cleanup_pidfile_if_owner() {
+    local pidfile="$1" owner_pid="${2:-$$}" current=""
+    [ -f "$pidfile" ] || return 0
+    current="$(cat "$pidfile" 2>/dev/null || true)"
+    [ "$current" = "$owner_pid" ] && rm -f "$pidfile"
+}
+
 # ===========================================================================
 # Docker visibility (READ-ONLY). ops observes containers; it NEVER restarts,
 # recreates, or otherwise mutates application containers. Only `docker ps`,
