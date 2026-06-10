@@ -38,6 +38,12 @@ http {
     #
     # $request_id is a built-in nginx variable (always populated per request).
     # ---------------------------------------------------------------------------
+    map "$uri:$arg_sid" $pixel_access_loggable {
+        default 1;
+        "~^/health:" 0;
+        "~:ops_healthcheck$" 0;
+    }
+
     log_format pixel_json escape=json
         '{"server":{'
             '"ts":"$time_iso8601",'
@@ -82,7 +88,7 @@ http {
             '"campaign_raw":"$arg_campaign_raw"'
          '}}';
 
-    access_log /var/log/nginx/access.log pixel_json;
+    access_log /var/log/nginx/access.log pixel_json if=$pixel_access_loggable;
     error_log  /var/log/nginx/error.log  warn;
 
     proxy_http_version 1.1;

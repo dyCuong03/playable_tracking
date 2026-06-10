@@ -247,11 +247,12 @@ reads `error` and raises a `redis-unreadable` alert.
 
 ### Pixel endpoint probe
 
-A bare `/p.gif` has no query params and returns **HTTP 400 by design** — the
-monitor labels this with a `note` so the dashboard never presents it as a real
-failure. Point the probe at a valid synthetic event instead:
+HTTP probes are disabled by default so ops does not create `/health` or
+`ops_healthcheck` entries in nginx/client logs. Enable a pixel probe only when
+you explicitly need a real ingest check:
 
 ```bash
+export OPS_PIXEL_PROBE_ENABLED=1
 export OPS_PIXEL_EXPECT_CODE=200
 export OPS_PIXEL_PROBE_PATH='/p.gif?e=interaction&sid=ops_healthcheck&env=ops&event_params=%7B%22name%22%3A%22ops_healthcheck%22%7D'
 # or an absolute URL (overrides the path):
@@ -263,7 +264,7 @@ fields inside the `event_params` JSON blob (URL-encoded `{"name":"ops_healthchec
 above). `env=ops` (≠ `production`) keeps the synthetic row in the `pixel_events_ver_2`
 table, not real production analytics, and `ops_healthcheck` marks it. Only a
 **configured** probe that misses `OPS_PIXEL_EXPECT_CODE` raises a `pixel-probe-bad`
-alert — the default bare 400 never alerts.
+alert.
 
 ### Where to point `PIXEL_BASE`
 
@@ -358,7 +359,8 @@ ops/
 | `HIGH_LATENCY_MS` / `QUEUE_BACKLOG_FILES` / `STUCK_PROCESSING_S` | `500` / `50` / `300` | monitor alert thresholds |
 | `OPS_DOCKER_CONTAINERS` | _(unset)_ | expected containers; set → missing/unhealthy alerts (monitor + logcollector) |
 | `OPS_REDIS_CONTAINER` / `OPS_REDIS_QUEUE_KEY` | _(unset)_ / `pixel:events` | redis depth via `docker exec` fallback (monitor) |
-| `OPS_PIXEL_PROBE_PATH` / `OPS_PIXEL_PROBE_URL` / `OPS_PIXEL_EXPECT_CODE` | bare `/p.gif` / _(unset)_ / `200` | configurable pixel probe (monitor) |
+| `OPS_HEALTH_PROBE_ENABLED` / `OPS_PIXEL_PROBE_ENABLED` | `0` / `0` | opt-in HTTP probes (monitor); disabled by default to keep request logs clean |
+| `OPS_PIXEL_PROBE_PATH` / `OPS_PIXEL_PROBE_URL` / `OPS_PIXEL_EXPECT_CODE` | synthetic `ops_healthcheck` / _(unset)_ / `200` | configurable pixel probe when `OPS_PIXEL_PROBE_ENABLED=1` |
 | `LOGCOLLECT_INTERVAL` | `60` | logcollector loop period (s) |
 | `OPS_LOG_DATE` | today's local date | override daily archive date for manual backfill (`YYYY-MM-DD`) |
 | `LOGCOLLECT_DOCKER_SINCE` / `LOGCOLLECT_DOCKER_UNTIL` / `LOGCOLLECT_DOCKER_TAIL` | local `00:00` / next-day `00:00` / `all` | docker-log window per container (logcollector) |
@@ -737,7 +739,7 @@ exporter run:
 
 | Path | Contents | Purpose |
 |------|----------|---------|
-| `ops/logs/<date>/docker/<container>.log` | Raw `docker logs` output (nginx access lines, app stderr, container stdout) | Human-readable daily archive; rolled by logcollector |
+| `ops/logs/<date>/docker/<container>.log` | Docker logs with internal probes filtered out (`/health`, `ops_healthcheck`) | Human-readable daily archive; rolled by logcollector |
 | `ops/logs/<date>/bq/nginx_requests.ndjson` | Parsed NDJSON — one row per HTTP request | Staging file before BigQuery upload |
 | `ops/logs/<date>/bq/redis_metrics.ndjson` | Parsed NDJSON — one Redis INFO row per poll interval | Staging file before BigQuery upload |
 | `ops/logs/<date>/bq/nginx_requests.status.json` | Status file (created when the nginx source is unavailable) | Explains why `nginx_requests.ndjson` is absent |

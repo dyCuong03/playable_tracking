@@ -99,17 +99,30 @@ check_alert() {
 # Probes
 # ---------------------------------------------------------------------------
 
-read HEALTH_CODE HEALTH_MS <<<"$(probe "$HEALTH_URL")"
+HEALTH_PROBE_ENABLED="${OPS_HEALTH_PROBE_ENABLED:-0}"
+case "$HEALTH_PROBE_ENABLED" in (1|true|TRUE|yes|YES) HEALTH_PROBE_ENABLED=1;; *) HEALTH_PROBE_ENABLED=0;; esac
+if [ "$HEALTH_PROBE_ENABLED" = "1" ]; then
+    read HEALTH_CODE HEALTH_MS <<<"$(probe "$HEALTH_URL")"
+else
+    HEALTH_CODE="disabled"
+    HEALTH_MS=0
+fi
 
-# --- Pixel endpoint probe (configurable; bare /p.gif returns 400 by design) ---
+# --- Pixel endpoint probe (disabled by default to keep request logs clean) ---
 # A valid pixel request needs e=<start|interaction|store_trigger|end>, sid, and
-# per-event params; a bare /p.gif has none, so 400 is EXPECTED. Operators point
-# OPS_PIXEL_PROBE_PATH/URL at a valid synthetic event (marked ops_healthcheck,
-# env!=production so it lands in the ver_2 table, not real analytics).
+# per-event params. Operators can opt in with OPS_PIXEL_PROBE_ENABLED=1 and
+# point OPS_PIXEL_PROBE_PATH/URL at a valid synthetic event.
 PIXEL_EXPECT="${OPS_PIXEL_EXPECT_CODE:-200}"
 PIXEL_CONFIGURED=0
+PIXEL_PROBE_ENABLED="${OPS_PIXEL_PROBE_ENABLED:-0}"
+case "$PIXEL_PROBE_ENABLED" in (1|true|TRUE|yes|YES) PIXEL_PROBE_ENABLED=1;; *) PIXEL_PROBE_ENABLED=0;; esac
 DEFAULT_PIXEL_PROBE_PATH="/p.gif?e=interaction&sid=ops_healthcheck&env=test&event_params=%7B%22name%22%3A%22ops_healthcheck%22%7D"
-if [ -n "${OPS_PIXEL_PROBE_URL:-}" ]; then
+if [ "$PIXEL_PROBE_ENABLED" != "1" ]; then
+    PIXEL_PROBE_URL=""
+    PIXEL_CODE="disabled"
+    PIXEL_MS=0
+    PIXEL_OK=true
+elif [ -n "${OPS_PIXEL_PROBE_URL:-}" ]; then
     PIXEL_PROBE_URL="$OPS_PIXEL_PROBE_URL"; PIXEL_CONFIGURED=1
 elif [ -n "${OPS_PIXEL_PROBE_PATH:-}" ]; then
     case "$OPS_PIXEL_PROBE_PATH" in
@@ -124,13 +137,15 @@ elif [ -n "${OPS_PIXEL_PROBE_PATH:-}" ]; then
 else
     PIXEL_PROBE_URL="${PIXEL_BASE}${DEFAULT_PIXEL_PROBE_PATH}"
 fi
-read PIXEL_CODE PIXEL_MS <<<"$(probe "$PIXEL_PROBE_URL")"
-if [ "$PIXEL_CODE" = "$PIXEL_EXPECT" ]; then PIXEL_OK=true; else PIXEL_OK=false; fi
+if [ "$PIXEL_PROBE_ENABLED" = "1" ]; then
+    read PIXEL_CODE PIXEL_MS <<<"$(probe "$PIXEL_PROBE_URL")"
+    if [ "$PIXEL_CODE" = "$PIXEL_EXPECT" ]; then PIXEL_OK=true; else PIXEL_OK=false; fi
+fi
 PIXEL_NOTE=""
 if [ "$PIXEL_OK" != "true" ] && [ "$PIXEL_CONFIGURED" = "0" ]; then
     PIXEL_NOTE='default synthetic pixel probe failed; set OPS_PIXEL_PROBE_PATH to a valid event such as /p.gif?e=interaction&sid=ops_healthcheck&env=test&event_params=%7B%22name%22%3A%22ops_healthcheck%22%7D'
 fi
-PIXEL_JSON="{\"url\":$(json_str "$PIXEL_PROBE_URL"),\"http_code\":$(json_str "$PIXEL_CODE"),\"expected_code\":$(json_str "$PIXEL_EXPECT"),\"ok\":${PIXEL_OK},\"latency_ms\":${PIXEL_MS},\"configured\":$([ "$PIXEL_CONFIGURED" = 1 ] && echo true || echo false)"
+PIXEL_JSON="{\"enabled\":$([ "$PIXEL_PROBE_ENABLED" = 1 ] && echo true || echo false),\"url\":$(json_str "$PIXEL_PROBE_URL"),\"http_code\":$(json_str "$PIXEL_CODE"),\"expected_code\":$(json_str "$PIXEL_EXPECT"),\"ok\":${PIXEL_OK},\"latency_ms\":${PIXEL_MS},\"configured\":$([ "$PIXEL_CONFIGURED" = 1 ] && echo true || echo false)"
 [ -n "$PIXEL_NOTE" ] && PIXEL_JSON="${PIXEL_JSON},\"note\":$(json_str "$PIXEL_NOTE")"
 PIXEL_JSON="${PIXEL_JSON}}"
 
@@ -433,7 +448,7 @@ read DISK_TOTAL DISK_USED DISK_AVAIL DISK_PCT <<<"$(df -Pk "$REPO_DIR" | awk 'NR
 # Snapshot JSON
 # ---------------------------------------------------------------------------
 SNAP="$(cat <<JSON
-{"ts":"$(ts_now)","role":"$ROLE","health":{"url":$(json_str "$HEALTH_URL"),"http_code":$(json_str "$HEALTH_CODE"),"latency_ms":${HEALTH_MS}},"pixel":${PIXEL_JSON},"redis":${REDIS_JSON},"docker":${DOCKER_JSON},"disk_queue":{"pending":{"files":${PEND_F},"bytes":${PEND_B}},"ready":{"files":${READY_F},"bytes":${READY_B}},"processing":{"files":${PROC_F},"bytes":${PROC_B}},"rejected":{"files":${REJ_F},"bytes":${REJ_B}},"total_files":${TOTAL_F},"total_bytes":${TOTAL_B},"backlog_files":${BACKLOG_F},"stuck_processing":${STUCK_COUNT},"oldest_processing_s":${OLDEST_PROC}},"processes":{"server":${P_SERVER},"worker":${P_WORKER},"dispatcher":${P_DISPATCH}},"system":{"loadavg_1m":${LA1},"loadavg_5m":${LA5},"loadavg_15m":${LA15},"nproc":${NPROC},"mem_total_mb":${MEM_TOTAL},"mem_used_mb":${MEM_USED},"mem_free_mb":${MEM_FREE},"disk":{"total_kb":${DISK_TOTAL:-0},"used_kb":${DISK_USED:-0},"avail_kb":${DISK_AVAIL:-0},"use_pct":${DISK_PCT:-0}}}}
+{"ts":"$(ts_now)","role":"$ROLE","health":{"enabled":$([ "$HEALTH_PROBE_ENABLED" = 1 ] && echo true || echo false),"url":$(json_str "$HEALTH_URL"),"http_code":$(json_str "$HEALTH_CODE"),"latency_ms":${HEALTH_MS}},"pixel":${PIXEL_JSON},"redis":${REDIS_JSON},"docker":${DOCKER_JSON},"disk_queue":{"pending":{"files":${PEND_F},"bytes":${PEND_B}},"ready":{"files":${READY_F},"bytes":${READY_B}},"processing":{"files":${PROC_F},"bytes":${PROC_B}},"rejected":{"files":${REJ_F},"bytes":${REJ_B}},"total_files":${TOTAL_F},"total_bytes":${TOTAL_B},"backlog_files":${BACKLOG_F},"stuck_processing":${STUCK_COUNT},"oldest_processing_s":${OLDEST_PROC}},"processes":{"server":${P_SERVER},"worker":${P_WORKER},"dispatcher":${P_DISPATCH}},"system":{"loadavg_1m":${LA1},"loadavg_5m":${LA5},"loadavg_15m":${LA15},"nproc":${NPROC},"mem_total_mb":${MEM_TOTAL},"mem_used_mb":${MEM_USED},"mem_free_mb":${MEM_FREE},"disk":{"total_kb":${DISK_TOTAL:-0},"used_kb":${DISK_USED:-0},"avail_kb":${DISK_AVAIL:-0},"use_pct":${DISK_PCT:-0}}}}
 JSON
 )"
 
@@ -445,16 +460,18 @@ printf '%s\n' "$SNAP"
 # Alerts (state-change only)
 # ---------------------------------------------------------------------------
 # health down
-if [ "$HEALTH_CODE" != "200" ]; then
+if [ "$HEALTH_PROBE_ENABLED" != "1" ]; then
+    check_alert "target-down" "error" 0 "health probe disabled"
+elif [ "$HEALTH_CODE" != "200" ]; then
     check_alert "target-down" "error" 1 "health probe returned http_code=$HEALTH_CODE at $HEALTH_URL"
 else
     check_alert "target-down" "error" 0 "health probe OK ($HEALTH_URL)"
 fi
 # high latency (only meaningful when up)
-if [ "$HEALTH_CODE" = "200" ] && [ "$HEALTH_MS" -gt "$HIGH_LATENCY_MS" ]; then
+if [ "$HEALTH_PROBE_ENABLED" = "1" ] && [ "$HEALTH_CODE" = "200" ] && [ "$HEALTH_MS" -gt "$HIGH_LATENCY_MS" ]; then
     check_alert "high-latency" "warn" 1 "health latency ${HEALTH_MS}ms > ${HIGH_LATENCY_MS}ms"
 else
-    check_alert "high-latency" "warn" 0 "health latency ${HEALTH_MS}ms within ${HIGH_LATENCY_MS}ms"
+    check_alert "high-latency" "warn" 0 "health latency probe disabled or within ${HIGH_LATENCY_MS}ms"
 fi
 # queue backlog
 if [ "$BACKLOG_F" -gt "$QUEUE_BACKLOG_FILES" ]; then
@@ -477,11 +494,11 @@ else
 fi
 # redis configured-but-unreadable
 check_alert "redis-unreadable" "warn" "$REDIS_ALERT" "$REDIS_DETAIL"
-# pixel probe bad — only when an operator configured a real probe (bare 400 default does not alert)
-if [ "$PIXEL_CONFIGURED" = "1" ] && [ "$PIXEL_OK" != "true" ]; then
+# pixel probe bad — only when an operator explicitly enables and configures it.
+if [ "$PIXEL_PROBE_ENABLED" = "1" ] && [ "$PIXEL_CONFIGURED" = "1" ] && [ "$PIXEL_OK" != "true" ]; then
     check_alert "pixel-probe-bad" "warn" 1 "pixel probe ${PIXEL_PROBE_URL} returned ${PIXEL_CODE} != expected ${PIXEL_EXPECT}"
 else
-    check_alert "pixel-probe-bad" "warn" 0 "pixel probe ok or default bare probe"
+    check_alert "pixel-probe-bad" "warn" 0 "pixel probe disabled or ok"
 fi
 # docker expected-container health (one dedup key per container; recovery fires when active=0)
 while IFS=$'\t' read -r tag dname dactive dsev ddetail; do

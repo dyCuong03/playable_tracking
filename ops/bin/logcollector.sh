@@ -105,6 +105,48 @@ count_re() {
     echo "${n:-0}"
 }
 
+filter_internal_probe_logs() {
+    local src="$1" dst="$2"
+    python3 - "$src" "$dst" <<'PY' 2>/dev/null || cp "$src" "$dst" 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+
+def is_internal_probe(line):
+    try:
+        item = json.loads(line)
+    except Exception:
+        return False
+
+    if not isinstance(item, dict):
+        return False
+
+    server = item.get("server") if isinstance(item.get("server"), dict) else item
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    uri = str(server.get("uri") or "")
+    sid = str(data.get("sid") or data.get("session_id") or "")
+    query = str(data.get("query") or "")
+    request_uri = str(data.get("request_uri") or "")
+
+    return (
+        uri == "/health"
+        or sid == "ops_healthcheck"
+        or "ops_healthcheck" in query
+        or "ops_healthcheck" in request_uri
+    )
+
+with src.open("r", encoding="utf-8", errors="replace") as fin, \
+        dst.open("w", encoding="utf-8") as fout:
+    for line in fin:
+        if is_internal_probe(line):
+            continue
+        fout.write(line)
+PY
+}
+
 # record_source NAME NEW_LINES_FILE [ERR_RE] [WARN_RE]
 # App logs use the JSON-level regexes (default); container logs pass the broader
 # generic matchers so plain error/fatal/exception lines are counted too.
@@ -234,18 +276,20 @@ if [ "$DOCKER_STATE" = "ok" ]; then
                 _docker_attempted=$((_docker_attempted+1))
                 if printf '%s\n' "$present" | grep -qx "$c"; then
                     tmp="$(mktemp)"
+                    filtered="$(mktemp)"
                     docker_log_args=(logs --since "$DOCKER_SINCE" --until "$DOCKER_UNTIL")
                     [ "$DOCKER_TAIL" != "all" ] && docker_log_args+=(--tail "$DOCKER_TAIL")
                     docker_log_args+=("$c")
                     if docker "${docker_log_args[@]}" > "$tmp" 2>&1; then
-                        cat "$tmp" > "$CONTDIR/$c.log"
-                        record_source "container:$c" "$tmp" "$GENERIC_ERR_RE" "$GENERIC_WARN_RE"
+                        filter_internal_probe_logs "$tmp" "$filtered"
+                        cat "$filtered" > "$CONTDIR/$c.log"
+                        record_source "container:$c" "$filtered" "$GENERIC_ERR_RE" "$GENERIC_WARN_RE"
                         _docker_collected=$((_docker_collected+1))
                     else
                         jlog "warn" "$ROLE" "docker logs failed for container" "{\"container\":$(json_str "$c")}" >> "$DOCKER_REASONS"
                         _docker_failed=$((_docker_failed+1))
                     fi
-                    rm -f "$tmp"
+                    rm -f "$tmp" "$filtered"
                 else
                     jlog "warn" "$ROLE" "container absent - skipped" "{\"container\":$(json_str "$c")}" >> "$DOCKER_REASONS"
                 fi
