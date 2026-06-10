@@ -51,3 +51,42 @@ test("writeDailyBatch writes NDJSON lines under a daily log file", () => {
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
 });
+
+test("writeDailyBatch splits entries into the daily file matching each timestamp", () => {
+    const previousLogDir = process.env.PIXEL_LOG_DIR;
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pixel-logs-"));
+
+    try {
+        process.env.PIXEL_LOG_DIR = tempDir;
+        const logService = loadLogService();
+
+        logService.writeDailyBatch("redis-queue", [
+            {
+                ts: "2026-06-09T12:00:00.000",
+                type: "redis-enqueue",
+                session_id: "day-1",
+            },
+            {
+                ts: "2026-06-10T12:00:00.000",
+                type: "redis-enqueue",
+                session_id: "day-2",
+            },
+        ]);
+
+        const dayOneFile = path.join(tempDir, "redis-queue", "2026-06-09.ndjson");
+        const dayTwoFile = path.join(tempDir, "redis-queue", "2026-06-10.ndjson");
+        const dayOneEntry = JSON.parse(fs.readFileSync(dayOneFile, "utf8").trim());
+        const dayTwoEntry = JSON.parse(fs.readFileSync(dayTwoFile, "utf8").trim());
+
+        assert.equal(dayOneEntry.session_id, "day-1");
+        assert.equal(dayTwoEntry.session_id, "day-2");
+    } finally {
+        if (previousLogDir === undefined) {
+            delete process.env.PIXEL_LOG_DIR;
+        } else {
+            process.env.PIXEL_LOG_DIR = previousLogDir;
+        }
+        delete require.cache[require.resolve("../src/services/log.service")];
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});

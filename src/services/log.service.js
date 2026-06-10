@@ -73,14 +73,28 @@ exports.writeDailyBatch = (name, events, silent = true) => {
     }
 
     const entries = events.map((event) => withTimestamp(event));
-    const payload = entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
 
     if (!silent) {
         entries.forEach((entry) => console.log(JSON.stringify(entry)));
     }
 
-    appendPayload(
-        path.join(getLogDir(), name, `${formatLocalDate(new Date(entries[0].ts))}.ndjson`),
-        payload
-    );
+    const batchesByDay = entries.reduce((acc, entry) => {
+        const day = formatLocalDate(new Date(entry.ts));
+
+        if (!acc.has(day)) {
+            acc.set(day, []);
+        }
+
+        acc.get(day).push(entry);
+        return acc;
+    }, new Map());
+
+    for (const [day, dayEntries] of batchesByDay.entries()) {
+        const payload = dayEntries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+
+        appendPayload(
+            path.join(getLogDir(), name, `${day}.ndjson`),
+            payload
+        );
+    }
 };
