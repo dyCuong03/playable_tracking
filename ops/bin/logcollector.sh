@@ -290,6 +290,53 @@ rm -f "$DOCKER_REASONS"
 # Clear a stale _docker-unavailable.log from an earlier run when docker is now ok.
 [ "$DOCKER_STATE" = "ok" ] && rm -f "$DOCKER_UNAVAIL" 2>/dev/null || true
 
+# Mirror the app-side Redis enqueue audit into the daily Redis docker archive
+# operators already inspect: ops/logs/<date>/docker/pixel-redis.log.
+# Redis itself does not log XADD payloads, so this appends a replaceable block
+# sourced from logs/redis-queue/<date>.ndjson after the raw Redis server log.
+append_redis_queue_audit_to_redis_log() {
+    local audit="$REPO_DIR/logs/redis-queue/$DATE.ndjson"
+    [ -s "$audit" ] || return 0
+
+    local target="$CONTDIR/${OPS_REDIS_CONTAINER:-pixel-redis}.log"
+    if [ ! -f "$target" ]; then
+        local found=""
+        found="$(find "$CONTDIR" -maxdepth 1 -type f -iname '*redis*.log' 2>/dev/null | head -n 1 || true)"
+        [ -n "$found" ] && target="$found"
+    fi
+
+    python3 - "$target" "$audit" "$DATE" <<'PY' 2>/dev/null || true
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1])
+audit = Path(sys.argv[2])
+date = sys.argv[3]
+begin = "# redis-queue-audit-begin"
+end = "# redis-queue-audit-end"
+
+base = ""
+if target.exists():
+    base = target.read_text(encoding="utf-8", errors="replace")
+    start = base.find(begin)
+    if start >= 0:
+        base = base[:start].rstrip() + "\n"
+
+audit_text = audit.read_text(encoding="utf-8", errors="replace").strip()
+if not audit_text:
+    raise SystemExit(0)
+
+target.parent.mkdir(parents=True, exist_ok=True)
+with target.open("w", encoding="utf-8") as f:
+    if base.strip():
+        f.write(base.rstrip() + "\n")
+    f.write(f"{begin} date={date} source=logs/redis-queue/{date}.ndjson\n")
+    f.write(audit_text)
+    f.write(f"\n{end}\n")
+PY
+}
+append_redis_queue_audit_to_redis_log
+
 # ---- 3. pm2 snapshot --------------------------------------------------------
 if command -v pm2 >/dev/null 2>&1; then
     pm2 jlist > "$DAYDIR/pm2-status.json" 2>/dev/null || true

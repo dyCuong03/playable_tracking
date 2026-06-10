@@ -108,18 +108,27 @@ read HEALTH_CODE HEALTH_MS <<<"$(probe "$HEALTH_URL")"
 # env!=production so it lands in the ver_2 table, not real analytics).
 PIXEL_EXPECT="${OPS_PIXEL_EXPECT_CODE:-200}"
 PIXEL_CONFIGURED=0
+DEFAULT_PIXEL_PROBE_PATH="/p.gif?e=interaction&sid=ops_healthcheck&env=test&event_params=%7B%22name%22%3A%22ops_healthcheck%22%7D"
 if [ -n "${OPS_PIXEL_PROBE_URL:-}" ]; then
     PIXEL_PROBE_URL="$OPS_PIXEL_PROBE_URL"; PIXEL_CONFIGURED=1
 elif [ -n "${OPS_PIXEL_PROBE_PATH:-}" ]; then
-    PIXEL_PROBE_URL="${PIXEL_BASE}${OPS_PIXEL_PROBE_PATH}"; PIXEL_CONFIGURED=1
+    case "$OPS_PIXEL_PROBE_PATH" in
+        *"event=ops_healthcheck"*)
+            PIXEL_PROBE_URL="${PIXEL_BASE}${DEFAULT_PIXEL_PROBE_PATH}"
+            ;;
+        *)
+            PIXEL_PROBE_URL="${PIXEL_BASE}${OPS_PIXEL_PROBE_PATH}"
+            ;;
+    esac
+    PIXEL_CONFIGURED=1
 else
-    PIXEL_PROBE_URL="$PIXEL_URL"
+    PIXEL_PROBE_URL="${PIXEL_BASE}${DEFAULT_PIXEL_PROBE_PATH}"
 fi
 read PIXEL_CODE PIXEL_MS <<<"$(probe "$PIXEL_PROBE_URL")"
 if [ "$PIXEL_CODE" = "$PIXEL_EXPECT" ]; then PIXEL_OK=true; else PIXEL_OK=false; fi
 PIXEL_NOTE=""
 if [ "$PIXEL_OK" != "true" ] && [ "$PIXEL_CONFIGURED" = "0" ]; then
-    PIXEL_NOTE='bare /p.gif probe has no query params; http 400 is EXPECTED. Set OPS_PIXEL_PROBE_PATH to a valid synthetic event (e.g. /p.gif?e=interaction&sid=ops_healthcheck&env=ops&event_params=%7B%22name%22%3A%22ops_healthcheck%22%7D) to probe the real ingest path.'
+    PIXEL_NOTE='default synthetic pixel probe failed; set OPS_PIXEL_PROBE_PATH to a valid event such as /p.gif?e=interaction&sid=ops_healthcheck&env=test&event_params=%7B%22name%22%3A%22ops_healthcheck%22%7D'
 fi
 PIXEL_JSON="{\"url\":$(json_str "$PIXEL_PROBE_URL"),\"http_code\":$(json_str "$PIXEL_CODE"),\"expected_code\":$(json_str "$PIXEL_EXPECT"),\"ok\":${PIXEL_OK},\"latency_ms\":${PIXEL_MS},\"configured\":$([ "$PIXEL_CONFIGURED" = 1 ] && echo true || echo false)"
 [ -n "$PIXEL_NOTE" ] && PIXEL_JSON="${PIXEL_JSON},\"note\":$(json_str "$PIXEL_NOTE")"

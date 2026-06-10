@@ -9,6 +9,7 @@ const {
     redisCommandTimeoutMs,
     redisUnavailableCooldownMs,
     redisErrorLogIntervalMs,
+    redisDedupeTtlSeconds,
 } = require("../config");
 const logService = require("./log.service");
 
@@ -149,6 +150,17 @@ const normalizeQueueItem = (item) => ({
     enqueuedAt: item && item.enqueuedAt ? item.enqueuedAt : new Date().toISOString(),
 });
 
+const getDedupeKey = (streamName, item) => {
+    const row = item && item.row ? item.row : {};
+    const eventHash = row.event_hash || "";
+
+    if (!eventHash || streamName !== redisQueueStream) {
+        return null;
+    }
+
+    return `pixel:dedupe:${streamName}:${eventHash}`;
+};
+
 const buildRedisQueueLogEntry = (streamName, item, messageId) => {
     const row = item && item.row ? item.row : {};
     const urlData = item && item.urlData ? item.urlData : null;
@@ -174,6 +186,13 @@ const buildRedisQueueLogEntry = (streamName, item, messageId) => {
     };
 };
 
+const buildRedisDedupeLogEntry = (streamName, item, dedupeKey) => ({
+    ...buildRedisQueueLogEntry(streamName, item, null),
+    type: "redis-dedup-skip",
+    dedupe_key: dedupeKey || null,
+    message: "Skipped duplicate Redis enqueue",
+});
+
 const logRedisQueueItems = (streamName, items, messageIds = []) => {
     if (!items.length) {
         return;
@@ -182,6 +201,18 @@ const logRedisQueueItems = (streamName, items, messageIds = []) => {
     logService.writeDailyBatch(
         "redis-queue",
         items.map((item, index) => buildRedisQueueLogEntry(streamName, item, messageIds[index])),
+        true
+    );
+};
+
+const logRedisDedupeItems = (streamName, items) => {
+    if (!items.length) {
+        return;
+    }
+
+    logService.writeDailyBatch(
+        "redis-queue",
+        items.map((item) => buildRedisDedupeLogEntry(streamName, item.item, item.dedupeKey)),
         true
     );
 };
@@ -247,8 +278,53 @@ const ensureQueueReady = async () => {
     await consumerGroupPromise;
 };
 
+const shouldEnqueueItem = async (streamName, item, dedupe) => {
+    if (!dedupe) {
+        return {
+            enqueue: true,
+            dedupeKey: null,
+        };
+    }
+
+    const dedupeKey = getDedupeKey(streamName, item);
+    if (!dedupeKey) {
+        return {
+            enqueue: true,
+            dedupeKey: null,
+        };
+    }
+
+    const response = await executeRedisCommand([
+        "SET",
+        dedupeKey,
+        "1",
+        "NX",
+        "EX",
+        Math.max(1, redisDedupeTtlSeconds),
+    ]);
+
+    return {
+        enqueue: response === "OK",
+        dedupeKey,
+    };
+};
+
 const produceToStream = async (streamName, item, options = {}) => {
+    const {
+        dedupe = true,
+        ...redisOptions
+    } = options;
     const queueItem = normalizeQueueItem(item);
+    const dedupeResult = await shouldEnqueueItem(streamName, queueItem, dedupe);
+
+    if (!dedupeResult.enqueue) {
+        logRedisDedupeItems(streamName, [{
+            item: queueItem,
+            dedupeKey: dedupeResult.dedupeKey,
+        }]);
+        return null;
+    }
+
     const messageId = await executeRedisCommand(
         [
             "XADD",
@@ -260,7 +336,7 @@ const produceToStream = async (streamName, item, options = {}) => {
             "payload",
             JSON.stringify(queueItem),
         ],
-        options
+        redisOptions
     );
 
     logRedisQueueItems(streamName, [queueItem], [messageId]);
@@ -274,6 +350,7 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
     }
 
     const {
+        dedupe = false,
         timeoutMs = Math.max(
             Math.max(100, redisCommandTimeoutMs),
             Math.min(30_000, Math.max(1, items.length) * 25)
@@ -285,8 +362,31 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
     const queueClient = await getClient();
     const pipeline = queueClient.MULTI();
     const queueItems = items.map((item) => normalizeQueueItem(item));
+    const enqueueItems = [];
+    const skippedItems = [];
 
-    for (let index = 0; index < queueItems.length; index += 1) {
+    for (const queueItem of queueItems) {
+        const dedupeResult = await shouldEnqueueItem(streamName, queueItem, dedupe);
+
+        if (dedupeResult.enqueue) {
+            enqueueItems.push(queueItem);
+        } else {
+            skippedItems.push({
+                item: queueItem,
+                dedupeKey: dedupeResult.dedupeKey,
+            });
+        }
+    }
+
+    if (skippedItems.length > 0) {
+        logRedisDedupeItems(streamName, skippedItems);
+    }
+
+    if (!enqueueItems.length) {
+        return [];
+    }
+
+    for (let index = 0; index < enqueueItems.length; index += 1) {
         pipeline.addCommand([
             "XADD",
             streamName,
@@ -295,7 +395,7 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
             Math.max(1000, redisQueueMaxLen),
             "*",
             "payload",
-            JSON.stringify(queueItems[index]),
+            JSON.stringify(enqueueItems[index]),
         ].map((value) => String(value)));
     }
 
@@ -311,7 +411,7 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
         throw error;
     });
 
-    logRedisQueueItems(streamName, queueItems, response);
+    logRedisQueueItems(streamName, enqueueItems, response);
 
     return response;
 };
@@ -325,7 +425,7 @@ const enqueueEventBatch = async (items) => {
         return [];
     }
 
-    return appendToStreamBatch(redisQueueStream, items);
+    return appendToStreamBatch(redisQueueStream, items, { dedupe: true });
 };
 
 const requeueItems = async (items) => {
@@ -333,7 +433,7 @@ const requeueItems = async (items) => {
         return;
     }
 
-    await appendToStreamBatch(redisQueueStream, items);
+    await appendToStreamBatch(redisQueueStream, items, { dedupe: false });
 };
 
 const rejectItems = async (items) => {
@@ -341,7 +441,7 @@ const rejectItems = async (items) => {
         return;
     }
 
-    await appendToStreamBatch(redisRejectedStream, items);
+    await appendToStreamBatch(redisRejectedStream, items, { dedupe: false });
 };
 
 const readQueueBatch = async (consumerName, count, blockMs) => {

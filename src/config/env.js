@@ -48,6 +48,7 @@ module.exports = {
     redisCommandTimeoutMs: parseNumber(process.env.REDIS_COMMAND_TIMEOUT_MS, 2_000),
     redisUnavailableCooldownMs: parseNumber(process.env.REDIS_UNAVAILABLE_COOLDOWN_MS, 5_000),
     redisErrorLogIntervalMs: parseNumber(process.env.REDIS_ERROR_LOG_INTERVAL_MS, 10_000),
+    redisDedupeTtlSeconds: parseNumber(process.env.REDIS_DEDUPE_TTL_SECONDS, 86_400),
     requestQueueMaxSize: parseNumber(process.env.REQUEST_QUEUE_MAX_SIZE, 50_000),
     requestQueueFlushBatchSize: parseNumber(process.env.REQUEST_QUEUE_FLUSH_BATCH_SIZE, 200),
     requestQueueFlushIntervalMs: parseNumber(process.env.REQUEST_QUEUE_FLUSH_INTERVAL_MS, 25),
