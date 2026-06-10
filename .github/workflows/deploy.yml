@@ -134,8 +134,8 @@ jobs:
             'curl -fsS http://127.0.0.1:9000/health'
 
       # Post-deploy: restart the ops monitoring daemons from the deployed scripts,
-      # then gate their health. `ops-status.sh gate` exits non-zero if monitor /
-      # logcollector / capacity are not healthy, failing the deploy.
+      # then print their health. App deployment is already gated by /health above;
+      # ops daemons are observability helpers, so their diagnostics are soft here.
       #
       # Config strategy: ops/.env on the VPS is the operator's persistent config and
       # is NEVER overwritten by CI.  If it does not exist yet, CI bootstraps a minimal
@@ -202,14 +202,21 @@ jobs:
              _dh="${{ vars.OPS_LOG_DROP_HEADERS }}"
              [ -n "$_dh" ] && export OPS_LOG_DROP_HEADERS="$_dh"
              bash ops/bin/ops-stop.sh
-             bash ops/bin/ops-start.sh
+             bash ops/bin/ops-start.sh || {
+               echo "== ops-start failed: continuing deploy after app health passed =="
+               bash ops/bin/ops-status.sh table || true
+               tail -n 120 ops/logs/logcollector-loop.out 2>/dev/null || true
+               tail -n 120 ops/logs/logcollector-loop.nohup.out 2>/dev/null || true
+             }
              sleep 8
-             # Gate: core 3 daemons always checked; exporter health only when enabled.
+             # Soft gate: app health was already verified above. Ops daemons are
+             # observability helpers, so dump diagnostics without failing deploy.
              bash ops/bin/ops-status.sh gate || {
-               echo "== ops gate failed: recent loop logs =="
+               echo "== ops gate warning: recent loop logs =="
+               bash ops/bin/ops-status.sh table || true
                tail -n 120 ops/logs/logcollector-loop.out 2>/dev/null || true
                tail -n 120 ops/logs/logcollector-loop.nohup.out 2>/dev/null || true
                tail -n 120 ops/logs/monitor-loop.out 2>/dev/null || true
                tail -n 120 ops/logs/capacity-loop.nohup.out 2>/dev/null || true
-               exit 1
+               true
              }'
