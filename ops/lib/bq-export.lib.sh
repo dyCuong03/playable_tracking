@@ -283,7 +283,7 @@ bq_invoke_uploader() {
 
     # Parse the single JSON line from stdout.
     local _parsed
-    _parsed="$(printf '%s\n' "${out:-}" | python3 - <<'PY' 2>/dev/null || true
+    _parsed="$(printf '%s\n' "${out:-}" | python3 /dev/fd/3 3<<'PY' 2>/dev/null || true
 import json, sys
 try:
     raw = sys.stdin.read().strip()
@@ -323,9 +323,8 @@ PY
 
 # _bq_nginx_parse_lines SOURCE CONTAINER HASH_IP ALLOWLIST
 # Reads raw nginx log lines from stdin; writes valid parsed NDJSON rows to stdout.
-# Detects JSON lines (start with '{') → pixel_json format (ts,remote_addr,request_id,
-#   method,uri,args,status,body_bytes_sent,request_time,upstream_response_time,
-#   upstream_status,http_referer,http_user_agent,host,data).
+# Detects JSON lines (start with '{') → pixel_json format
+#   ({server:{...},data:{...}}; falls back to the old top-level JSON shape).
 # Falls back to nginx combined format for non-JSON lines.
 # Unparseable lines are silently skipped (count logged to stderr).
 _bq_nginx_parse_lines() {
@@ -335,7 +334,7 @@ _bq_nginx_parse_lines() {
     CONTAINER="$container" \
     HASH_IP="$hash_ip" \
     ALLOWLIST="$allowlist" \
-    python3 - <<'PY'
+    python3 /dev/fd/3 3<<'PY'
 import sys, os, re, json, hashlib
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
@@ -442,19 +441,25 @@ for raw_line in sys.stdin:
     if line.startswith("{"):
         try:
             d = json.loads(line)
-            event_date, ts = parse_iso_ts(d.get("ts", ""))
-            remote_addr = d.get("remote_addr", "") or ""
-            request_id  = d.get("request_id") or None
-            method      = d.get("method") or None
-            uri         = d.get("uri") or ""
-            data_obj    = d.get("data") if isinstance(d.get("data"), dict) else {}
-            args_str    = d.get("args") or data_obj.get("query") or ""
-            status_raw  = d.get("status")
-            body_bytes  = d.get("body_bytes_sent")
-            req_time    = d.get("request_time")
-            ups_time    = d.get("upstream_response_time")
-            referer     = d.get("http_referer") or None
-            user_agent  = d.get("http_user_agent") or ""
+            server_obj = d.get("server") if isinstance(d.get("server"), dict) else d
+            data_obj   = d.get("data") if isinstance(d.get("data"), dict) else {}
+
+            event_date, ts = parse_iso_ts(
+                server_obj.get("ts")
+                or server_obj.get("server_time")
+                or d.get("ts", "")
+            )
+            remote_addr = server_obj.get("remote_addr", "") or ""
+            request_id  = server_obj.get("request_id") or None
+            method      = server_obj.get("method") or None
+            uri         = server_obj.get("uri") or data_obj.get("request_uri") or ""
+            args_str    = data_obj.get("query") or server_obj.get("args") or d.get("args") or ""
+            status_raw  = server_obj.get("status")
+            body_bytes  = server_obj.get("body_bytes_sent")
+            req_time    = server_obj.get("request_time")
+            ups_time    = server_obj.get("upstream_response_time")
+            referer     = server_obj.get("http_referer") or None
+            user_agent  = server_obj.get("http_user_agent") or ""
 
             # Build path; merge uri + args for query filtering.
             path = uri

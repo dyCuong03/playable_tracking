@@ -694,24 +694,25 @@ rolling restart of app-only containers does **not** reload nginx's config.
 
 ```nginx
 log_format pixel_json escape=json
-    '{"ts":"$time_iso8601",'
-     '"server_time":"$time_iso8601",'
-     '"server_epoch_time":"$msec",'
-     '"remote_addr":"$remote_addr",'
-     '"request_id":"$request_id",'
-     '"method":"$request_method",'
-     '"uri":"$uri",'
-     '"args":"$args",'
-     '"status":$status,'
-     '"body_bytes_sent":$body_bytes_sent,'
-     '"request_time":$request_time,'
-     '"request_processing_time":$request_time,'
-     '"upstream_response_time":"$upstream_response_time",'
-     '"upstream_processing_time":"$upstream_response_time",'
-     '"upstream_status":"$upstream_status",'
-     '"http_referer":"$http_referer",'
-     '"http_user_agent":"$http_user_agent",'
-     '"host":"$host",'
+    '{"server":{'
+       '"ts":"$time_iso8601",'
+       '"server_time":"$time_iso8601",'
+       '"server_epoch_time":"$msec",'
+       '"remote_addr":"$remote_addr",'
+       '"request_id":"$request_id",'
+       '"method":"$request_method",'
+       '"uri":"$uri",'
+       '"status":$status,'
+       '"body_bytes_sent":$body_bytes_sent,'
+       '"request_time":$request_time,'
+       '"request_processing_time":$request_time,'
+       '"upstream_response_time":"$upstream_response_time",'
+       '"upstream_processing_time":"$upstream_response_time",'
+       '"upstream_status":"$upstream_status",'
+       '"http_referer":"$http_referer",'
+       '"http_user_agent":"$http_user_agent",'
+       '"host":"$host"'
+     '},'
      '"data":{"request_uri":"$request_uri","query":"$args", "...known pixel query args":"..."} }';
 
 access_log /var/log/nginx/access.log pixel_json;
@@ -723,8 +724,8 @@ error_log  /var/log/nginx/error.log  warn;
 > `docker logs` with no extra bind-mount needed.
 
 The exporter auto-detects JSON lines (first character `{`) and maps:
-`request_time` (seconds) → `request_time_ms` (integer milliseconds),
-`upstream_response_time` → `upstream_response_time_ms`, and sets
+`server.request_time` (seconds) → `request_time_ms` (integer milliseconds),
+`server.upstream_response_time` → `upstream_response_time_ms`, and sets
 `raw_format = "json"`. Without `pixel_json` the exporter still works with the
 `combined` fallback parser, but `request_time_ms`, `upstream_response_time_ms`,
 `request_id`, and `raw_format` will be `null`.
