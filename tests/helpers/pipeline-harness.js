@@ -13,8 +13,27 @@ const os = require("os");
 const path = require("path");
 const Module = require("module");
 
+require("./isolate-queue-dir"); // process-wide default: never the repo ./data dir
 const { createFakeRedis } = require("./fake-redis");
 const { createFakeBigQuery } = require("./fake-bigquery");
+
+// ── Determinism guard ────────────────────────────────────────────────────────
+// A stray unhandled rejection (e.g. a background loop outliving teardown) can flip the
+// process exit code AFTER the TAP summary, silently turning a green run red on CI. Install
+// a one-time guard so any such rejection is printed LOUDLY with its stack (so CI logs name
+// the culprit) and the exit code is set deterministically — never a silent flip.
+if (!global.__PIXEL_TEST_REJECTION_GUARD__) {
+    global.__PIXEL_TEST_REJECTION_GUARD__ = true;
+    process.on("unhandledRejection", (reason) => {
+        const err = reason instanceof Error ? reason : new Error(String(reason));
+        process.stderr.write(`\n*** STRAY UNHANDLED REJECTION (test leak) ***\n${err.stack || err.message}\n`);
+        process.exitCode = 1;
+    });
+    process.on("uncaughtException", (error) => {
+        process.stderr.write(`\n*** STRAY UNCAUGHT EXCEPTION (test leak) ***\n${error.stack || error.message}\n`);
+        process.exitCode = 1;
+    });
+}
 
 const SERVICE_MODULES = [
     "../../src/config",
@@ -23,6 +42,7 @@ const SERVICE_MODULES = [
     "../../src/services/bigquery.service",
     "../../src/services/bigquery-queue.service",
     "../../src/services/redis-queue.service",
+    "../../src/services/pipeline-health.service",
     "../../src/services/request-dispatcher.service",
     "../../src/services/bigquery-worker.service",
     "../../src/services/event.service",
@@ -153,20 +173,52 @@ const createPipeline = (options = {}) => {
     }
     const uninstallMocks = installModuleMocks(mocks);
 
-    clearServiceCache();
+    // CRITICAL: the Module._load patch is GLOBAL. If requiring the services throws (or
+    // mkdtemp/env setup fails), the mock must NOT leak into later specs — that would
+    // corrupt the whole suite nondeterministically. Tear everything down on any setup error.
+    let services;
+    try {
+        clearServiceCache();
+        services = {
+            config: require("../../src/config"),
+            log: require("../../src/services/log.service"),
+            bigquery: require("../../src/services/bigquery.service"),
+            diskQueue: require("../../src/services/bigquery-queue.service"),
+            redisQueue: require("../../src/services/redis-queue.service"),
+            dispatcher: require("../../src/services/request-dispatcher.service"),
+            worker: require("../../src/services/bigquery-worker.service"),
+            event: require("../../src/services/event.service"),
+            controller: require("../../src/controllers/pixel.controller"),
+            app: require("../../src/app"),
+        };
 
-    const services = {
-        config: require("../../src/config"),
-        log: require("../../src/services/log.service"),
-        bigquery: require("../../src/services/bigquery.service"),
-        diskQueue: require("../../src/services/bigquery-queue.service"),
-        redisQueue: require("../../src/services/redis-queue.service"),
-        dispatcher: require("../../src/services/request-dispatcher.service"),
-        worker: require("../../src/services/bigquery-worker.service"),
-        event: require("../../src/services/event.service"),
-        controller: require("../../src/controllers/pixel.controller"),
-        app: require("../../src/app"),
-    };
+        // Optional phase-2 health service — only present once the backend lands it.
+        try {
+            services.health = require("../../src/services/pipeline-health.service");
+        } catch (_) {
+            services.health = null;
+        }
+
+        // Fail LOUDLY and EARLY if the env did not reach config (would otherwise surface as
+        // a cryptic "BigQuery is not fully configured" thrown deep inside startWorker, only
+        // on the worker-using specs). This makes any env-application regression obvious.
+        if (!services.bigquery.isBigQueryConfigured()) {
+            throw new Error(
+                "pipeline-harness: BigQuery not configured after applyEnv — "
+                + `BIGQUERY_ENABLED=${process.env.BIGQUERY_ENABLED} BIGQUERY_DATASET=${process.env.BIGQUERY_DATASET}`
+            );
+        }
+    } catch (error) {
+        uninstallMocks();
+        restoreEnv();
+        clearServiceCache();
+        try {
+            fs.rmSync(tempRoot, { recursive: true, force: true });
+        } catch (_) {
+            // best effort
+        }
+        throw error;
+    }
 
     return {
         redis,
@@ -201,14 +253,27 @@ const drainDiskToRedis = async (services, maxRounds = 50) => {
             continue;
         }
 
-        for (const claim of claimed) {
-            const items = await diskQueue.parseQueueFile(claim.processingFile);
-            if (items.length) {
-                // persistRequest is disk-only; the dispatcher pushes batches to Redis.
-                await redisQueue.enqueueEventBatch(items);
-                totalItems += items.length;
+        const pending = new Set(claimed);
+        try {
+            for (const claim of claimed) {
+                const items = await diskQueue.parseQueueFile(claim.processingFile);
+                if (items.length) {
+                    // persistRequest is disk-only; the dispatcher pushes batches to Redis.
+                    await redisQueue.enqueueEventBatch(items);
+                    totalItems += items.length;
+                }
+                await diskQueue.completeProcessingFile(claim.processingFile);
+                pending.delete(claim);
             }
-            await diskQueue.completeProcessingFile(claim.processingFile);
+        } catch (error) {
+            // Mirror runBridgeLoop: on failure release ALL still-claimed files back to
+            // ready/ so they are retried after recovery (nothing stranded in processing/).
+            await Promise.all(
+                [...pending].map((claim) =>
+                    diskQueue.releaseProcessingFile(claim.processingFile, claim.readyFile).catch(() => {})
+                )
+            );
+            throw error;
         }
     }
 
@@ -259,12 +324,20 @@ const runWorkerUntilDrained = async (services, redisState, options = {}) => {
         quietRounds = 3,
     } = options;
 
-    const workerPromise = services.worker.startWorker();
+    // Capture any worker-loop rejection immediately so it can never surface as an
+    // unhandled rejection while we poll; rethrow it when we await at the end.
+    let workerError = null;
+    const workerPromise = Promise.resolve()
+        .then(() => services.worker.startWorker())
+        .catch((error) => {
+            workerError = error;
+        });
+
     const deadline = Date.now() + timeoutMs;
     let consecutiveEmpty = 0;
 
     try {
-        while (Date.now() < deadline) {
+        while (Date.now() < deadline && !workerError) {
             await sleep(100);
             const len = redisState.streamLength(stream);
             const pending = redisState.pendingCount(stream, group);
@@ -281,6 +354,10 @@ const runWorkerUntilDrained = async (services, redisState, options = {}) => {
     } finally {
         services.worker.stopWorker();
         await workerPromise;
+    }
+
+    if (workerError) {
+        throw workerError;
     }
 };
 

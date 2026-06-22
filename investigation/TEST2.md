@@ -134,6 +134,37 @@ WORKER STOPPED (events in Redis stream, no worker consuming):
 
 Regenerate any time with `node scripts/trace-event.js` (real services, fake Redis + mock BQ).
 
+## CI determinism hardening (tests/helpers only — no src changes)
+
+Investigated a CI-only failure (`78 tests, 71 pass, 5 fail, 2 skipped`, ~14s on the GH
+node-20 runner; never reproducible in a clean single-process local run — 8/8 green, ~44s
+each on node 20). Root-cause class: nondeterministic test-harness leaks that surface under
+a loaded/shared runner, plus the lead's observed `exit 1 with fail 0` (a stray
+unhandledRejection from a background loop outliving teardown). Hardened the harness so the
+suite is deterministic regardless of runner speed:
+
+1. **Global `Module._load` mock can no longer leak.** `createPipeline` now wraps service
+   require in try/catch — on ANY setup failure it uninstalls the mock, restores env, clears
+   the cache, and removes the temp dir before rethrowing. Previously a single setup throw
+   left the mock installed and corrupted every later spec (cascade of failures).
+2. **No background loop outlives its test.** `runWorkerUntilDrained` captures the worker
+   promise immediately with `.catch` (so a `startWorker` rejection can never become an
+   unhandled rejection while polling), always `stopWorker()`s in `finally`, and rethrows
+   the captured error. `trace2`'s real-dispatcher test now captures the bridge promise and
+   `await`s it on stop (even on throw) before teardown.
+3. **Stray-rejection guard.** A one-time `process.on("unhandledRejection"/"uncaughtException")`
+   handler prints the offender's stack to stderr (bypassing the console capture) and sets a
+   deterministic non-zero exit — converting a silent exit-code flip into a loud, diagnosable
+   failure. Verified it catches a deliberate `Promise.reject`.
+4. **Fail-fast config assertion.** `createPipeline` asserts `isBigQueryConfigured()` right
+   after setup, so any future env-application regression fails with a clear message instead
+   of a cryptic deep `startWorker` throw on only the worker-using specs.
+
+Validation: 8/8 sequential single-process full runs on node 20 → exit 0, 76 pass, 0 fail,
+0 stray. (A 4-way parallel stress only fails on the pre-existing specs that share the real
+`data/bigquery-queue` dir across processes — an artifact of running 4 suites at once;
+CI uses `--test-concurrency=1`, one file at a time, so that collision cannot occur there.)
+
 ## Notes
 - `pipeline-health.spec.js` and `ops-check-pipeline.spec.js` self-skip if the backend
   health module / ops script are absent; with both landed they are active and green.

@@ -1,3 +1,4 @@
+require("./helpers/isolate-queue-dir"); // MUST be first: redirect disk queue to a temp dir before src loads
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");

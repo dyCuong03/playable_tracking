@@ -85,19 +85,21 @@ test("real dispatcher loop writes a dispatcher heartbeat and backlog-summary log
     const pipeline = createPipeline();
     const capture = createConsoleCapture();
     const N = 15;
+    let bridgePromise = null;
     try {
         for (let i = 0; i < N; i += 1) {
             assert.equal(await runController(pipeline.services.controller, interactionEvent(`sess-disp-hb-${i}`, `t-${i}`)), 200);
         }
 
-        // Run the REAL dispatcher bridge loop (not the inline drain helper).
-        pipeline.services.dispatcher.startDispatcher();
+        // Run the REAL dispatcher bridge loop (not the inline drain helper). Capture the
+        // loop promise so it is awaited on stop — never left to outlive the test.
+        bridgePromise = pipeline.services.dispatcher.startDispatcher();
         const deadline = Date.now() + 10_000;
         while (Date.now() < deadline && pipeline.redis.state.xaddCount("pixel:events") < N) {
             await sleep(50);
         }
         pipeline.services.dispatcher.stopDispatcher();
-        await sleep(50);
+        await bridgePromise; // ensure the loop has fully exited before any teardown
         capture.restore();
 
         assert.equal(pipeline.redis.state.xaddCount("pixel:events"), N, "dispatcher drained all events");
@@ -117,6 +119,10 @@ test("real dispatcher loop writes a dispatcher heartbeat and backlog-summary log
     } finally {
         capture.restore();
         pipeline.services.dispatcher.stopDispatcher();
+        // Always await the loop's exit before teardown, even if the body threw.
+        if (bridgePromise) {
+            await bridgePromise.catch(() => {});
+        }
         await pipeline.cleanup();
     }
 });

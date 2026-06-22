@@ -1,3 +1,4 @@
+require("./helpers/isolate-queue-dir"); // MUST be first: keep any disk/log writes off the repo data/ dir
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");

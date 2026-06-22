@@ -82,9 +82,65 @@ const createFakeRedis = () => {
             value,
             expireAt: ttlSeconds ? now() + ttlSeconds * 1000 : null,
         });
-        counters.dedupeOk += 1;
+        if (nx) {
+            counters.dedupeOk += 1;
+        }
         return "OK";
     };
+
+    const liveRecord = (key) => {
+        const record = kv.get(key);
+        if (!record) {
+            return null;
+        }
+        if (isExpired(record)) {
+            kv.delete(key);
+            return null;
+        }
+        return record;
+    };
+
+    const cmdGet = (args) => {
+        const record = liveRecord(args[1]);
+        return record ? record.value : null;
+    };
+
+    const cmdExists = (args) => args.slice(1).reduce((count, key) => count + (liveRecord(key) ? 1 : 0), 0);
+
+    const cmdDel = (args) => args.slice(1).reduce((count, key) => count + (kv.delete(key) ? 1 : 0), 0);
+
+    const cmdTtl = (args) => {
+        const record = liveRecord(args[1]);
+        if (!record) {
+            return -2;
+        }
+        if (!record.expireAt) {
+            return -1;
+        }
+        return Math.max(0, Math.ceil((record.expireAt - now()) / 1000));
+    };
+
+    const globToRegExp = (pattern) => {
+        const escaped = String(pattern).replace(/[.+^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`^${escaped.replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
+    };
+
+    // SCAN cursor [MATCH pattern] [COUNT n] [TYPE t] -> [nextCursor, [keys...]].
+    // We return everything matching in one pass (cursor always "0").
+    const cmdScan = (args) => {
+        const matchIndex = args.indexOf("MATCH");
+        const pattern = matchIndex >= 0 ? args[matchIndex + 1] : "*";
+        const matcher = globToRegExp(pattern);
+        const keys = [];
+        for (const key of kv.keys()) {
+            if (matcher.test(key) && liveRecord(key)) {
+                keys.push(key);
+            }
+        }
+        return ["0", keys];
+    };
+
+    const cmdKeys = (args) => cmdScan([null, "0", "MATCH", args[1]])[1];
 
     const cmdXadd = (args) => {
         // XADD stream MAXLEN ~ N * payload <json>  (we ignore MAXLEN trimming)
@@ -274,6 +330,19 @@ const createFakeRedis = () => {
         switch (command) {
         case "SET":
             return cmdSet(args);
+        case "GET":
+            return cmdGet(args);
+        case "EXISTS":
+            return cmdExists(args);
+        case "DEL":
+        case "UNLINK":
+            return cmdDel(args);
+        case "TTL":
+            return cmdTtl(args);
+        case "SCAN":
+            return cmdScan(args);
+        case "KEYS":
+            return cmdKeys(args);
         case "XADD":
             return cmdXadd(args);
         case "XGROUP":
@@ -312,6 +381,40 @@ const createFakeRedis = () => {
             },
             sendCommand(args) {
                 return exec(args);
+            },
+            // High-level convenience surface (redis v4 client) routed through exec, so the
+            // fake works whether the backend uses sendCommand([...]) or these helpers.
+            async get(key) {
+                return exec(["GET", key]);
+            },
+            async set(key, value, options = {}) {
+                const args = ["SET", key, value];
+                if (options && options.EX) {
+                    args.push("EX", options.EX);
+                }
+                if (options && options.NX) {
+                    args.push("NX");
+                }
+                return exec(args);
+            },
+            async ttl(key) {
+                return exec(["TTL", key]);
+            },
+            async exists(key) {
+                return exec(["EXISTS", key]);
+            },
+            async del(key) {
+                return exec(["DEL", key]);
+            },
+            async keys(pattern) {
+                return exec(["KEYS", pattern]);
+            },
+            async *scanIterator(options = {}) {
+                const match = options && options.MATCH ? options.MATCH : "*";
+                const [, keys] = await exec(["SCAN", "0", "MATCH", match]);
+                for (const key of keys) {
+                    yield key;
+                }
             },
             MULTI() {
                 const queued = [];
@@ -355,6 +458,23 @@ const createFakeRedis = () => {
             },
             xaddCount(name) {
                 return counters.xaddByStream[name] || 0;
+            },
+            // Direct key access for seeding/inspecting heartbeats in tests.
+            setKey(key, value, ttlSeconds = null) {
+                kv.set(key, {
+                    value: typeof value === "string" ? value : JSON.stringify(value),
+                    expireAt: ttlSeconds ? now() + ttlSeconds * 1000 : null,
+                });
+            },
+            getKey(key) {
+                const record = liveRecord(key);
+                return record ? record.value : null;
+            },
+            scanKeys(pattern) {
+                return cmdScan([null, "0", "MATCH", pattern])[1];
+            },
+            deleteKey(key) {
+                return kv.delete(key);
             },
         },
     };
