@@ -8,6 +8,7 @@
     "start:worker": "node src/worker.js",
     "start:dispatcher": "node src/dispatcher.js",
     "test:tracking": "node scripts/test-tracking.js",
+    "ops:check-pipeline": "node scripts/check-pipeline.js",
     "test": "node --test --test-concurrency=1 tests/*.spec.js"
   },
   "repository": {

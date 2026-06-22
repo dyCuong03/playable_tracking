@@ -202,6 +202,17 @@ const executeRedisCommand = async (args, options = {}) => {
 
 const sendRedisCommand = async (args) => executeRedisCommand(args);
 
+// Best-effort command for out-of-band observability (pipeline heartbeats). Never throws
+// and never trips the queue's unavailable-cooldown — a failed heartbeat write must not
+// degrade the hot enqueue path. Returns null on any error.
+const sendCommandSafe = async (args, options = {}) => {
+    try {
+        return await executeRedisCommand(args, { markUnavailableOnError: false, ...options });
+    } catch (_) {
+        return null;
+    }
+};
+
 const normalizeQueueItem = (item) => ({
     ...item,
     attempts: Number(item && item.attempts ? item.attempts : 0),
@@ -693,4 +704,5 @@ module.exports = {
     acknowledgeMessages,
     getQueueStats,
     redactRedisUrl,
+    sendCommandSafe,
 };

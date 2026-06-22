@@ -9,7 +9,9 @@ const {
     bigQueryWorkerPollMs,
     bigQueryWorkerLeaseMs,
     bigQueryWorkerName,
+    pipelineHeartbeatIntervalMs,
 } = require("../config");
+const { recordHeartbeat } = require("./pipeline-health.service");
 const {
     insertBatch,
     isBigQueryConfigured,
@@ -32,7 +34,29 @@ let stopping = false;
 let lastErrorLogAt = 0;
 let lastWarnLogAt = 0;
 
+// Cross-process worker liveness, surfaced via pixel:health:worker:<id>.
+let workerLastConsumeAt = null;
+let workerLastInsertAt = null;
+let workerBqFailureCount = 0;
+let lastWorkerHealthAt = 0;
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const writeWorkerHealth = async (force) => {
+    const now = Date.now();
+    if (!force && (now - lastWorkerHealthAt) < Math.max(1000, pipelineHeartbeatIntervalMs)) {
+        return;
+    }
+
+    lastWorkerHealthAt = now;
+
+    await recordHeartbeat(`worker:${workerName}`, {
+        worker_id: workerName,
+        lastConsumeAt: workerLastConsumeAt,
+        lastInsertAt: workerLastInsertAt,
+        bqFailureCount: workerBqFailureCount,
+    });
+};
 
 const shouldLogNow = (lastLogAt) => (Date.now() - lastLogAt) >= bigQueryErrorLogIntervalMs;
 
@@ -296,6 +320,12 @@ const processMessages = async (items) => {
         const chunk = chunks[index];
         const chunkMessageIds = chunk.items.map((item) => item.messageId);
 
+        emitWorkerEvent("bigquery-insert-attempt", "Attempting BigQuery insert for Redis chunk", {
+            tableName: chunk.tableName,
+            count: chunk.items.length,
+            event_hashes: collectEventHashes(chunk.items),
+        });
+
         try {
             await insertBatch(
                 chunk.tableName,
@@ -303,6 +333,7 @@ const processMessages = async (items) => {
             );
             await acknowledgeMessages(chunkMessageIds);
             summary.inserted += chunk.items.length;
+            workerLastInsertAt = new Date().toISOString();
             logWorker("info", "bigquery-worker-insert", "Inserted Redis chunk to BigQuery", {
                 tableName: chunk.tableName,
                 count: chunk.items.length,
@@ -315,6 +346,7 @@ const processMessages = async (items) => {
                 event_hashes: collectEventHashes(chunk.items),
             });
         } catch (error) {
+            workerBqFailureCount += 1;
             emitWorkerEvent("bigquery-insert-failed", "BigQuery insert failed for Redis chunk", {
                 tableName: chunk.tableName,
                 count: chunk.items.length,
@@ -435,6 +467,8 @@ const startWorker = async () => {
     logWorker("info", "bigquery-worker", "BigQuery Redis worker started");
 
     while (!stopping) {
+        await writeWorkerHealth(false);
+
         try {
             await ensureQueueReady();
 
@@ -447,6 +481,7 @@ const startWorker = async () => {
             );
 
             if (reclaimedItems.length > 0) {
+                workerLastConsumeAt = new Date().toISOString();
                 emitWorkerEvent("redis-consume-success", "Reclaimed pending Redis stream entries", {
                     source: "xautoclaim",
                     count: reclaimedItems.length,
@@ -461,6 +496,7 @@ const startWorker = async () => {
                     dropped: reclaimSummary.dropped,
                     dedup: 0,
                 });
+                await writeWorkerHealth(true);
                 continue;
             }
 
@@ -483,6 +519,7 @@ const startWorker = async () => {
                 continue;
             }
 
+            workerLastConsumeAt = new Date().toISOString();
             emitWorkerEvent("redis-consume-success", "Consumed Redis stream entries", {
                 source: "xreadgroup",
                 count: items.length,
@@ -498,6 +535,7 @@ const startWorker = async () => {
                 dropped: batchSummary.dropped,
                 dedup: 0,
             });
+            await writeWorkerHealth(true);
         } catch (error) {
             logWorker("error", "bigquery-worker", "Worker loop failed", {
                 reason: error.message,

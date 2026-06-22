@@ -63,4 +63,17 @@ module.exports = {
     rateLimitWindowMs: parseNumber(process.env.RATE_LIMIT_WINDOW_MS, 10_000),
     rateLimitMax: parseNumber(process.env.RATE_LIMIT_MAX, 200),
     rateLimitPrefix: process.env.RATE_LIMIT_PREFIX || "rate_limit:p.gif",
+    // ── Pipeline health / silent-failure detection (phase 2) ──────────────────
+    // Heartbeats are written by each tier (web/dispatcher/worker) and expire after
+    // the TTL — a missing key means that tier is dead/stuck. TTL should be ~3x the
+    // writer interval so a single skipped beat does not flap the status.
+    pipelineHeartbeatTtlSeconds: parseNumber(process.env.PIPELINE_HEARTBEAT_TTL_SECONDS, 30),
+    pipelineHeartbeatIntervalMs: parseNumber(process.env.PIPELINE_HEARTBEAT_INTERVAL_MS, 5_000),
+    pipelineDispatcherStaleMs: parseNumber(process.env.PIPELINE_DISPATCHER_STALE_MS, 30_000),
+    pipelineWorkerStaleMs: parseNumber(process.env.PIPELINE_WORKER_STALE_MS, 30_000),
+    pipelineBqStaleMs: parseNumber(process.env.PIPELINE_BQ_STALE_MS, 30_000),
+    pipelineWebAcceptRecentMs: parseNumber(process.env.PIPELINE_WEB_ACCEPT_RECENT_MS, 30_000),
+    pipelineDiskBacklogWarn: parseNumber(process.env.PIPELINE_DISK_BACKLOG_WARN, 5_000),
+    pipelineStreamWarn: parseNumber(process.env.PIPELINE_STREAM_WARN, 10_000),
+    pipelineHealthKeyPrefix: process.env.PIPELINE_HEALTH_KEY_PREFIX || "pixel:health:",
 };

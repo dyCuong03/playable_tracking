@@ -112,6 +112,7 @@ const run = async () => {
 
     let acceptedHttp = 0;
     let rejectedHttp = 0;
+    let diskPersisted = 0;
 
     // Suppress the (very chatty) per-insert JSON logs while the load runs.
     const capture = createConsoleCapture();
@@ -127,7 +128,7 @@ const run = async () => {
             }
         }
 
-        const redisEnqueued = await drainDiskToRedis(services);
+        diskPersisted = await drainDiskToRedis(services);
         await runWorkerUntilDrained(services, redis.state, { timeoutMs: 120_000 });
     } finally {
         capture.restore();
@@ -154,6 +155,7 @@ const run = async () => {
         ["requested", requests.length],
         ["accepted HTTP (200)", acceptedHttp],
         ["rejected HTTP (4xx/5xx)", rejectedHttp],
+        ["disk persisted (NDJSON)", diskPersisted],
         ["redis enqueued (XADD)", xaddMain],
         ["worker consumed", consumed],
         ["dedup skipped", dedupSkipped],

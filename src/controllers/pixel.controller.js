@@ -2,9 +2,42 @@ const { buildEvent } = require("../services/event.service");
 const { sendPixel } = require("../services/pixel.service");
 const { buildRow, resolveTableName } = require("../services/bigquery.service");
 const { persistRequest } = require("../services/request-dispatcher.service");
+const { recordHeartbeat } = require("../services/pipeline-health.service");
 const logService = require("../services/log.service");
 
 const EVENT_NAME_WHITELIST = new Set(["start", "interaction", "store_trigger", "end"]);
+
+// Web-tier liveness. Bumping a Redis heartbeat on every pixel would add a network round
+// trip to the hot path, so coalesce: at most one heartbeat write per second, fired-and-
+// forgotten (recordHeartbeat is itself best-effort and never throws).
+let lastWebHeartbeatAt = 0;
+const WEB_HEARTBEAT_MIN_INTERVAL_MS = 1000;
+
+const bumpWebHeartbeat = () => {
+    const now = Date.now();
+    if ((now - lastWebHeartbeatAt) < WEB_HEARTBEAT_MIN_INTERVAL_MS) {
+        return;
+    }
+
+    lastWebHeartbeatAt = now;
+    void recordHeartbeat("web", { lastAcceptAt: new Date(now).toISOString() });
+};
+
+const logPipelineEvent = (level, type, fields = {}) => {
+    const entry = {
+        ts: new Date().toISOString(),
+        level,
+        type,
+        queue_backend: "redis-stream",
+        ...fields,
+    };
+
+    if (level === "error") {
+        console.error(JSON.stringify(entry));
+    } else {
+        console.log(JSON.stringify(entry));
+    }
+};
 
 const normalizeQueryValue = (value) => {
     if (Array.isArray(value)) {
@@ -142,6 +175,16 @@ exports.trackPixel = async (req, res) => {
             urlData,
         });
         sendPixel(res);
+        bumpWebHeartbeat();
+        logPipelineEvent("info", "disk-persist-success", {
+            tableName,
+            event_hash: row.event_hash || null,
+            event_name: row.event_name || null,
+            session_id: row.session_id || null,
+            playable_id: row.playable_id || null,
+            package_name: row.package_name || null,
+            env: row.env || null,
+        });
         logServerRequest({
             message: "Tracking request persisted to durable queue",
             statusCode: 200,
@@ -164,6 +207,16 @@ exports.trackPixel = async (req, res) => {
         }));
 
         sendPixel(res, 503);
+        logPipelineEvent("error", "disk-persist-failed", {
+            tableName,
+            event_hash: row.event_hash || null,
+            event_name: row.event_name || null,
+            session_id: row.session_id || null,
+            playable_id: row.playable_id || null,
+            package_name: row.package_name || null,
+            env: row.env || null,
+            reason: error.message,
+        });
         logServerRequest({
             message: "Failed to persist tracking request",
             statusCode: 503,

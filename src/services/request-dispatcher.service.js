@@ -6,7 +6,9 @@ const {
     requestQueueBridgeMaxFilesPerRun,
     requestQueueRetryDelayMs,
     bigQueryErrorLogIntervalMs,
+    pipelineHeartbeatIntervalMs,
 } = require("../config");
+const { recordHeartbeat, summarizeDiskQueue } = require("./pipeline-health.service");
 const {
     enqueueEvent: enqueueDiskEvent,
     rotatePendingFiles,
@@ -29,7 +31,9 @@ let bridgeState = {
     running: false,
     processingFile: null,
     lastSuccessAt: null,
+    lastErrorAt: null,
 };
+let lastDispatcherHealthAt = 0;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -91,10 +95,51 @@ const getApproximateItemCount = (stats) => {
     return Math.max(0, Math.floor(bytes / 450));
 };
 
+// Publish the dispatcher's cross-process liveness to Redis + structured logs. Throttled to
+// the heartbeat interval on idle loops, but forced after a real dispatch so lastSuccessAt is
+// always fresh. Best-effort: a health write must never break the dispatch loop.
+const writeDispatcherHealth = async (force, itemsDispatched) => {
+    const now = Date.now();
+    if (!force && (now - lastDispatcherHealthAt) < Math.max(1000, pipelineHeartbeatIntervalMs)) {
+        return;
+    }
+
+    lastDispatcherHealthAt = now;
+
+    const diskStats = await getQueueStats().catch(() => null);
+    const disk = summarizeDiskQueue(diskStats);
+
+    await recordHeartbeat("dispatcher", {
+        running: bridgeState.running,
+        lastSuccessAt: bridgeState.lastSuccessAt,
+        lastErrorAt: bridgeState.lastErrorAt,
+        dispatcher_id: workerName,
+        diskBacklog: disk.total,
+    });
+
+    logDispatcher("info", "dispatcher-status", "Dispatcher heartbeat", {
+        running: bridgeState.running,
+        lastSuccessAt: bridgeState.lastSuccessAt,
+        lastErrorAt: bridgeState.lastErrorAt,
+        dispatcher_id: workerName,
+    });
+
+    logDispatcher("info", "dispatcher-backlog-summary", "Disk backlog summary", {
+        pending: disk.pending,
+        ready: disk.ready,
+        processing: disk.processing,
+        total: disk.total,
+        itemsDispatched: Number(itemsDispatched || 0),
+        dispatcher_id: workerName,
+    });
+};
+
 const runBridgeLoop = async () => {
     while (!stopping) {
         let claimedFiles = [];
         let processingFile = null;
+
+        await writeDispatcherHealth(false, 0);
 
         try {
             await rotatePendingFiles();
@@ -134,7 +179,10 @@ const runBridgeLoop = async () => {
                 fileCount: claimedFiles.length,
                 itemCount: items.length,
             });
+            await writeDispatcherHealth(true, items.length);
         } catch (error) {
+            bridgeState.lastErrorAt = new Date().toISOString();
+
             if (claimedFiles.length > 0) {
                 await Promise.all(
                     claimedFiles.map((claimedFile) => releaseProcessingFile(
