@@ -109,6 +109,15 @@ mock BigQuery. New specs (all pass):
 - `tests/trace2.spec.js` — one `event_hash` across HTTP→disk→redis→worker→mock-BQ incl. new logs; real
   dispatcher loop writes `pixel:health:dispatcher` + `dispatcher-backlog-summary`.
 
+**CI determinism hardening (qa, tests/** only — no src changes, behavior unchanged):** harness leaks that
+surfaced as flakiness on the shared CI runner were fixed in `tests/helpers/pipeline-harness.js` (no leaked
+global `Module._load` mock on setup throw; background worker/dispatcher loops always awaited+stopped with
+promise rejections captured; process-level unhandledRejection/uncaughtException guard) plus a new
+`tests/helpers/isolate-queue-dir.js` that redirects each process's disk queue to a per-process temp dir so
+specs never contend on the repo's `./data/bigquery-queue`. Architect re-confirmed: 2 consecutive `npm test`
+→ 78/76/0/2, exit 0 each (qa reports 5/5 sequential + 4/4 parallel-stress, previously 2/4 failing). All
+phase-2 evidence is unchanged.
+
 ---
 
 ## 4. Commands run + results (architect, independent)
