@@ -62,6 +62,7 @@ on:
       - main
     paths:
       - 'src/**'
+      - 'tests/**'
       - 'ops/**'
       - 'scripts/**'
       - 'Dockerfile'
