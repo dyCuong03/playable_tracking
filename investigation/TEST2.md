@@ -160,10 +160,22 @@ suite is deterministic regardless of runner speed:
    after setup, so any future env-application regression fails with a clear message instead
    of a cryptic deep `startWorker` throw on only the worker-using specs.
 
-Validation: 8/8 sequential single-process full runs on node 20 → exit 0, 76 pass, 0 fail,
-0 stray. (A 4-way parallel stress only fails on the pre-existing specs that share the real
-`data/bigquery-queue` dir across processes — an artifact of running 4 suites at once;
-CI uses `--test-concurrency=1`, one file at a time, so that collision cannot occur there.)
+5. **Shared real-dir contention removed (belt-and-suspenders).** New
+   `tests/helpers/isolate-queue-dir.js` redirects the disk queue + logs to a per-PROCESS
+   `mkdtemp` dir (set before any src loads, cleaned on process exit), so the suite never
+   writes to the repo's real `./data/bigquery-queue` and parallel processes/jobs can't
+   collide. Wired into the existing disk-touching specs (`pixel.spec.js`,
+   `bigquery-queue.service.spec.js`, `health.spec.js`, `redis-queue.service.spec.js`) and
+   the harness. (Per-spec dirs aren't feasible — `bigquery-queue.service` caches `BASE_DIR`
+   at first load, shared across specs in a process — so per-process isolation is the
+   equivalent, correct granularity.)
+
+Validation on node 20 (`nvm use 20 && npm ci && npm test`):
+- 5/5 (and earlier 8/8) sequential single-process full runs → exit 0, 76 pass, 0 fail, 0 stray.
+- Heavy specs tight loop → clean every iteration.
+- 4-way parallel full-suite stress: BEFORE the dir isolation, 2/4 processes failed
+  (pixel.spec / bigquery-queue.service.spec colliding on the shared real `data/` dir);
+  AFTER, all 4/4 pass 76/0/0. The repo `./data/bigquery-queue` is no longer created by the suite.
 
 ## Notes
 - `pipeline-health.spec.js` and `ops-check-pipeline.spec.js` self-skip if the backend
