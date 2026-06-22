@@ -56,6 +56,53 @@ const logRedisError = (error) => {
     logService.writeDaily("redis-queue", entry, true);
 };
 
+// Strip any user:password credentials out of the Redis URL before it is exposed on a
+// public health/debug endpoint. Never leak connection secrets to HTTP callers.
+const redactRedisUrl = (url) => {
+    try {
+        const parsed = new URL(String(url || ""));
+        const port = parsed.port ? `:${parsed.port}` : "";
+        return `${parsed.protocol}//${parsed.hostname}${port}`;
+    } catch (_) {
+        return "redis://[redacted]";
+    }
+};
+
+// Contract log events for the enqueue (Redis XADD) stage. These go to stdout/stderr only
+// (not the redis-queue daily audit batch) so they never perturb the index-based audit-log
+// assertions, while still making every enqueue attempt/success/failure traceable by
+// event_hash end-to-end.
+const emitEnqueueEvent = (type, fields = {}) => {
+    const entry = {
+        ts: new Date().toISOString(),
+        level: type === "redis-enqueue-failed" ? "error" : "info",
+        type,
+        queue_backend: "redis-stream",
+        ...fields,
+    };
+
+    if (entry.level === "error") {
+        console.error(JSON.stringify(entry));
+    } else {
+        console.log(JSON.stringify(entry));
+    }
+};
+
+const describeQueueItem = (streamName, item, extra = {}) => {
+    const row = item && item.row ? item.row : {};
+
+    return {
+        event_hash: row.event_hash || null,
+        event_name: row.event_name || null,
+        session_id: row.session_id || null,
+        playable_id: row.playable_id || null,
+        package_name: row.package_name || null,
+        env: row.env || null,
+        queue_key: streamName,
+        ...extra,
+    };
+};
+
 const resetClientState = () => {
     consumerGroupPromise = null;
     clientPromise = null;
@@ -100,7 +147,18 @@ const getClient = async () => {
             url: redisUrl,
             socket: {
                 connectTimeout: Math.max(100, redisConnectTimeoutMs),
-                reconnectStrategy: false,
+                // Bounded exponential-ish backoff so a transient Redis blip recovers in
+                // place instead of permanently tripping the unavailable-cooldown and
+                // throwing on every enqueue. Cap the per-attempt delay at 3s and give up
+                // after a bounded number of attempts, at which point the error surfaces to
+                // markRedisUnavailable() (cooldown) and a fresh client is created later.
+                reconnectStrategy: (retries) => {
+                    if (retries > 20) {
+                        return new Error("Redis reconnect attempts exhausted");
+                    }
+
+                    return Math.min(retries * 100, 3000);
+                },
             },
         });
 
@@ -176,6 +234,9 @@ const buildRedisQueueLogEntry = (streamName, item, messageId) => {
         event_hash: row.event_hash || null,
         session_id: row.session_id || null,
         event_name: row.event_name || null,
+        playable_id: row.playable_id || null,
+        package_name: row.package_name || null,
+        env: row.env || null,
         event_time: row.event_time || null,
         received_at: row.received_at || null,
         data: urlData || {
@@ -309,6 +370,21 @@ const shouldEnqueueItem = async (streamName, item, dedupe) => {
     };
 };
 
+// Best-effort XLEN so enqueue/consume logs can report stream depth. Never throws and
+// never trips the unavailable-cooldown — it is purely observational.
+const getStreamLengthSafe = async (streamName) => {
+    try {
+        const length = await executeRedisCommand(
+            ["XLEN", streamName],
+            { markUnavailableOnError: false }
+        );
+
+        return Number(length || 0);
+    } catch (_) {
+        return null;
+    }
+};
+
 const produceToStream = async (streamName, item, options = {}) => {
     const {
         dedupe = true,
@@ -325,21 +401,39 @@ const produceToStream = async (streamName, item, options = {}) => {
         return null;
     }
 
-    const messageId = await executeRedisCommand(
-        [
-            "XADD",
-            streamName,
-            "MAXLEN",
-            "~",
-            Math.max(1000, redisQueueMaxLen),
-            "*",
-            "payload",
-            JSON.stringify(queueItem),
-        ],
-        redisOptions
-    );
+    emitEnqueueEvent("redis-enqueue-attempt", describeQueueItem(streamName, queueItem, { count: 1 }));
+
+    let messageId;
+    try {
+        messageId = await executeRedisCommand(
+            [
+                "XADD",
+                streamName,
+                "MAXLEN",
+                "~",
+                Math.max(1000, redisQueueMaxLen),
+                "*",
+                "payload",
+                JSON.stringify(queueItem),
+            ],
+            redisOptions
+        );
+    } catch (error) {
+        emitEnqueueEvent("redis-enqueue-failed", describeQueueItem(streamName, queueItem, {
+            count: 1,
+            message: error.message,
+        }));
+        throw error;
+    }
 
     logRedisQueueItems(streamName, [queueItem], [messageId]);
+
+    const streamLen = await getStreamLengthSafe(streamName);
+    emitEnqueueEvent("redis-enqueue-success", describeQueueItem(streamName, queueItem, {
+        count: 1,
+        message_id: messageId || null,
+        stream_len: streamLen,
+    }));
 
     return messageId;
 };
@@ -386,6 +480,12 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
         return [];
     }
 
+    emitEnqueueEvent("redis-enqueue-attempt", {
+        queue_key: streamName,
+        count: enqueueItems.length,
+        event_hashes: enqueueItems.map((queueItem) => (queueItem.row && queueItem.row.event_hash) || null),
+    });
+
     for (let index = 0; index < enqueueItems.length; index += 1) {
         pipeline.addCommand([
             "XADD",
@@ -408,10 +508,26 @@ const appendToStreamBatch = async (streamName, items, options = {}) => {
             markRedisUnavailable(error);
         }
 
+        emitEnqueueEvent("redis-enqueue-failed", {
+            queue_key: streamName,
+            count: enqueueItems.length,
+            message: error.message,
+            event_hashes: enqueueItems.map((queueItem) => (queueItem.row && queueItem.row.event_hash) || null),
+        });
+
         throw error;
     });
 
     logRedisQueueItems(streamName, enqueueItems, response);
+
+    const streamLen = await getStreamLengthSafe(streamName);
+    enqueueItems.forEach((queueItem, index) => {
+        emitEnqueueEvent("redis-enqueue-success", describeQueueItem(streamName, queueItem, {
+            count: 1,
+            message_id: (response && response[index]) || null,
+            stream_len: streamLen,
+        }));
+    });
 
     return response;
 };
@@ -556,7 +672,7 @@ const getQueueStats = async () => {
 
     return {
         backend: "redis-stream",
-        redisUrl,
+        redisUrl: redactRedisUrl(redisUrl),
         stream: redisQueueStream,
         group: redisQueueGroup,
         length: Number(length || 0),
@@ -576,4 +692,5 @@ module.exports = {
     claimPendingBatch,
     acknowledgeMessages,
     getQueueStats,
+    redactRedisUrl,
 };

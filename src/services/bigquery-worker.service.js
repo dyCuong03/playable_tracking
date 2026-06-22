@@ -72,6 +72,33 @@ const logWorker = (level, type, message, details = {}) => {
     logService.writeDaily("worker", entry, true);
 };
 
+// Contract events (redis-consume-*, bigquery-insert-*, worker-batch-summary). Unlike
+// logWorker(), these are NEVER rate-limited or suppressed — every consume/insert outcome
+// must be visible so a single event is traceable end-to-end and zero loss is provable.
+const emitWorkerEvent = (type, message, details = {}) => {
+    const entry = {
+        ts: new Date().toISOString(),
+        level: type.endsWith("-failed") ? "error" : "info",
+        type,
+        message,
+        worker_id: workerName,
+        queue_backend: "redis-stream",
+        ...details,
+    };
+
+    if (entry.level === "error") {
+        console.error(JSON.stringify(entry));
+    } else {
+        console.log(JSON.stringify(entry));
+    }
+
+    logService.writeDaily("worker", entry, true);
+};
+
+const collectEventHashes = (items) => items
+    .map((item) => (item && item.row && item.row.event_hash) || null)
+    .filter(Boolean);
+
 const summarizeItems = (items) => items.map((item) => {
     const row = item && item.row ? item.row : {};
     const data = item && item.urlData
@@ -257,8 +284,10 @@ const logRejectedItems = async (rejectedItems, tableName) => {
 };
 
 const processMessages = async (items) => {
+    const summary = { inserted: 0, retried: 0, dropped: 0 };
+
     if (!items.length) {
-        return;
+        return summary;
     }
 
     const chunks = buildChunks(items);
@@ -273,13 +302,25 @@ const processMessages = async (items) => {
                 chunk.items.map((item) => item.row)
             );
             await acknowledgeMessages(chunkMessageIds);
+            summary.inserted += chunk.items.length;
             logWorker("info", "bigquery-worker-insert", "Inserted Redis chunk to BigQuery", {
                 tableName: chunk.tableName,
                 count: chunk.items.length,
                 messageIds: chunkMessageIds,
                 data: summarizeItems(chunk.items),
             });
+            emitWorkerEvent("bigquery-insert-success", "Inserted Redis chunk to BigQuery", {
+                tableName: chunk.tableName,
+                count: chunk.items.length,
+                event_hashes: collectEventHashes(chunk.items),
+            });
         } catch (error) {
+            emitWorkerEvent("bigquery-insert-failed", "BigQuery insert failed for Redis chunk", {
+                tableName: chunk.tableName,
+                count: chunk.items.length,
+                message: error.message,
+                event_hashes: collectEventHashes(chunk.items),
+            });
             const failedInsertIds = new Set(getFailedInsertIds(error));
 
             if (failedInsertIds.size > 0) {
@@ -321,6 +362,9 @@ const processMessages = async (items) => {
                     });
                 }
 
+                summary.retried += retryItems.length;
+                summary.dropped += rejectedItems.length;
+
                 if (retryItems.length > 0) {
                     await requeueItems(retryItems);
                     logWorker("warn", "bigquery-worker-retry", "Re-queued retryable rows after partial BigQuery failure", {
@@ -353,6 +397,9 @@ const processMessages = async (items) => {
 
             const retrySplit = splitRetryableItems(chunk.items, error.message);
 
+            summary.retried += retrySplit.retryItems.length;
+            summary.dropped += retrySplit.rejected.length;
+
             if (retrySplit.retryItems.length > 0) {
                 await requeueItems(retrySplit.retryItems);
             }
@@ -376,6 +423,8 @@ const processMessages = async (items) => {
             await sleep(Math.max(1000, bigQueryRetryDelayMs));
         }
     }
+
+    return summary;
 };
 
 const startWorker = async () => {
@@ -398,21 +447,57 @@ const startWorker = async () => {
             );
 
             if (reclaimedItems.length > 0) {
-                await processMessages(reclaimedItems);
+                emitWorkerEvent("redis-consume-success", "Reclaimed pending Redis stream entries", {
+                    source: "xautoclaim",
+                    count: reclaimedItems.length,
+                    event_hashes: collectEventHashes(reclaimedItems),
+                });
+                const reclaimSummary = await processMessages(reclaimedItems);
+                emitWorkerEvent("worker-batch-summary", "Worker batch complete", {
+                    source: "xautoclaim",
+                    consumed: reclaimedItems.length,
+                    inserted: reclaimSummary.inserted,
+                    retried: reclaimSummary.retried,
+                    dropped: reclaimSummary.dropped,
+                    dedup: 0,
+                });
                 continue;
             }
 
-            const items = await readQueueBatch(
-                workerName,
-                readBatchSize,
-                Math.max(250, bigQueryWorkerPollMs)
-            );
+            let items;
+            try {
+                items = await readQueueBatch(
+                    workerName,
+                    readBatchSize,
+                    Math.max(250, bigQueryWorkerPollMs)
+                );
+            } catch (error) {
+                emitWorkerEvent("redis-consume-failed", "Failed to read from Redis stream", {
+                    source: "xreadgroup",
+                    message: error.message,
+                });
+                throw error;
+            }
 
             if (!items.length) {
                 continue;
             }
 
-            await processMessages(items);
+            emitWorkerEvent("redis-consume-success", "Consumed Redis stream entries", {
+                source: "xreadgroup",
+                count: items.length,
+                event_hashes: collectEventHashes(items),
+            });
+
+            const batchSummary = await processMessages(items);
+            emitWorkerEvent("worker-batch-summary", "Worker batch complete", {
+                source: "xreadgroup",
+                consumed: items.length,
+                inserted: batchSummary.inserted,
+                retried: batchSummary.retried,
+                dropped: batchSummary.dropped,
+                dedup: 0,
+            });
         } catch (error) {
             logWorker("error", "bigquery-worker", "Worker loop failed", {
                 reason: error.message,

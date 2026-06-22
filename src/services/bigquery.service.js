@@ -80,11 +80,19 @@ const resolveTableName = (event) => {
 };
 
 const hashEvent = (event) => {
+    // event_hash is reused as the BigQuery streaming insertId for dedupe AND as the
+    // Redis dedupe key. It must be wide enough that two *distinct* interactions never
+    // collide (cross-env / cross-playable collisions were silently dedup-dropping valid
+    // events), yet deterministic so an EXACT duplicate resend hashes identically and the
+    // intentional idempotency is preserved.
     const payload = JSON.stringify({
         sid: event.sid || "",
         event: event.event || "",
         eventTime: event.eventTime || "",
         params: event.params || {},
+        playableId: event.playableId || "",
+        packageName: event.packageName || "",
+        env: event.trackingEnvironment || "",
     });
 
     return crypto.createHash("sha256").update(payload).digest("hex");
@@ -96,6 +104,11 @@ const buildRow = (event) => ({
     event_time: event.eventTime,
     package_name: event.packageName || "",
     playable_id: event.playableId || "",
+    // Thread the tracking environment through the row so it reaches the queue item,
+    // Redis, and every log line. Not necessarily a BigQuery column — getTableSchema /
+    // formatRowForInsert drops fields that are absent from the live table schema, so
+    // carrying it on the row is safe even when the table has no `env` column.
+    env: event.trackingEnvironment || "",
     ip: event.ip || "",
     referer: event.referer || "",
     received_at: new Date().toISOString(),
