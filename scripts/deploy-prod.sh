@@ -216,6 +216,7 @@ for i in $(seq 1 "$WORKER_COUNT"); do
   docker run -d \
     --name "$WORKER_NAME" \
     --restart always \
+    --no-healthcheck \
     --network "$NETWORK_NAME" \
     --ulimit nofile=200000:200000 \
     -e NODE_ENV=production \
@@ -255,6 +256,7 @@ for i in $(seq 1 "$DISPATCHER_COUNT"); do
   docker run -d \
     --name "$DISPATCHER_NAME" \
     --restart always \
+    --no-healthcheck \
     --network "$NETWORK_NAME" \
     --ulimit nofile=200000:200000 \
     -e NODE_ENV=production \
