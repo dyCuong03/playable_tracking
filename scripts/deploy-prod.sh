@@ -151,6 +151,7 @@ for i in $(seq 1 "$APP_REPLICAS"); do
   docker run -d \
     --name "$SERVER_APP_NAME" \
     --restart always \
+    --no-healthcheck \
     --network "$NETWORK_NAME" \
     --ulimit nofile=200000:200000 \
     -e NODE_ENV=production \
@@ -186,10 +187,15 @@ for i in $(seq 1 "$APP_REPLICAS"); do
 done
 
 echo "Waiting for app containers to become healthy..."
+# Containers run with --no-healthcheck (Docker HEALTHCHECK spawns a Node process
+# per container every 30s forever, which pins dockerd CPU). Readiness is polled
+# actively here via a one-shot /health probe — the Node spawn is bounded to deploy
+# time only, not the container lifetime.
+HEALTH_PROBE='require("http").get("http://127.0.0.1:"+(process.env.PORT||9000)+"/health",r=>process.exit(r.statusCode===200?0:1)).on("error",()=>process.exit(1))'
 for i in $(seq 1 "$APP_REPLICAS"); do
   SERVER_APP_NAME="${SERVER_APP_PREFIX}-${i}"
   ATTEMPTS=0
-  until [ "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}unknown{{end}}' "$SERVER_APP_NAME")" = "healthy" ]; do
+  until docker exec "$SERVER_APP_NAME" node -e "$HEALTH_PROBE" >/dev/null 2>&1; do
     ATTEMPTS=$((ATTEMPTS + 1))
     if [ "$ATTEMPTS" -ge 30 ]; then
       echo "App container ${SERVER_APP_NAME} did not become healthy in time"

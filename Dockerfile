@@ -28,10 +28,12 @@ COPY src ./src
 EXPOSE 9000
 
 # =========================
-# HEALTHCHECK (NO CURL)
+# HEALTHCHECK
 # =========================
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD node -e "require('http').get('http://127.0.0.1:'+(process.env.PORT||9000)+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+# Intentionally NO HEALTHCHECK. A Docker HEALTHCHECK here cold-starts a Node
+# process per container on every interval (× all replicas, forever), which pins
+# dockerd CPU. Readiness is probed actively at deploy time (scripts/deploy-prod.sh)
+# and the web tier is health-gated by nginx (max_fails/fail_timeout) at runtime.
 
 # =========================
 # START
